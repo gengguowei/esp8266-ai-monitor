@@ -41,6 +41,7 @@ class StatusSnapshot
     public CodexStatus Codex = new();
     public long Ts;
     public bool MusicPlaying;
+    public bool ScreenOn = true;
 
     /// Serializes to the exact JSON shape the firmware's parseStatusJson expects.
     public byte[] ToJson()
@@ -51,6 +52,7 @@ class StatusSnapshot
             w.WriteStartObject();
             w.WriteNumber("ts", Ts);
             w.WriteBoolean("music_playing", MusicPlaying);
+            w.WriteBoolean("screen_on", ScreenOn);
             w.WriteStartObject("claude");
             w.WriteString("status", Claude.Status);
             w.WriteNumber("tokens_today", Claude.TokensToday);
@@ -105,6 +107,7 @@ class StatusSnapshot
             Codex = (CodexStatus)Codex.MemberwiseCloneOf(),
             Ts = Ts,
             MusicPlaying = MusicPlaying,
+            ScreenOn = ScreenOn,
         };
     }
 }
@@ -136,6 +139,10 @@ sealed class StatusService
     /// Whether audio is playing right now (drives the device's AUTO -> music
     /// auto-switch). Set from NowPlayingMonitor in Program.
     public Func<bool> MusicPlayingProvider;
+
+    /// Whether the device backlight should be temporarily enabled. Windows
+    /// session lock/suspend state supplies this without changing user brightness.
+    public Func<bool> ScreenOnProvider;
 
     // Hook-pushed live state (POST /event from Claude Code / Codex hooks).
     // Events beat the mtime heuristic while fresh: "working" for up to 10min
@@ -276,6 +283,7 @@ sealed class StatusService
             snap.Claude.NeedsInput = NeedsInput(_claudeNeedsInputAt, now);
             snap.Codex.NeedsInput = NeedsInput(_codexNeedsInputAt, now);
             snap.MusicPlaying = MusicPlayingProvider?.Invoke() ?? false;
+            snap.ScreenOn = ScreenOnProvider?.Invoke() ?? true;
             return snap;
         }
     }

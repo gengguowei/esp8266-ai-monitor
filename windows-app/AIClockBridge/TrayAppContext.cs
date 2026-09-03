@@ -12,6 +12,7 @@ sealed class TrayAppContext : ApplicationContext
     readonly NotifyIcon _trayIcon;
     readonly StatusService _service;
     readonly UsageFetcher _usage;
+    readonly WindowsScreenPowerController _screenPower;
     readonly int _port;
     readonly MirrorForm _mirror;
     readonly ContextMenuStrip _menu = new();
@@ -22,10 +23,12 @@ sealed class TrayAppContext : ApplicationContext
     readonly Dictionary<string, ToolStripMenuItem> _modeItems = new();
 
     public TrayAppContext(StatusService service, UsageFetcher usage, NetSpeedMonitor netMonitor,
-                          NowPlayingMonitor nowPlaying, StockMonitor stockMonitor, int port)
+                          NowPlayingMonitor nowPlaying, StockMonitor stockMonitor,
+                          WindowsScreenPowerController screenPower, int port)
     {
         _service = service;
         _usage = usage;
+        _screenPower = screenPower;
         _port = port;
         _mirror = new MirrorForm(service, netMonitor, nowPlaying, stockMonitor);
 
@@ -91,6 +94,15 @@ sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(displayMenu);
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
 
+        var followLockItem = new ToolStripMenuItem("跟随 Windows 锁屏")
+        {
+            CheckOnClick = true,
+            Checked = _screenPower.Enabled,
+        };
+        followLockItem.CheckedChanged += (_, _) =>
+            _screenPower.Enabled = followLockItem.Checked;
+        _menu.Items.Add(followLockItem);
+
         _menu.Items.Add(MakeItem("设置自选股…", (_, _) =>
         {
             var input = InputDialog.Show(
@@ -149,7 +161,8 @@ sealed class TrayAppContext : ApplicationContext
 
     static string UsageLine(string name, ProviderUsage u, string weeklyLabel)
     {
-        if (u.Error != null && u.PrimaryPct == null) return $"{name}：{u.Error}";
+        if (u.Error != null && u.PrimaryPct == null && u.WeeklyPct == null)
+            return $"{name}：{u.Error}";
         var parts = new List<string>();
         if (u.PrimaryPct.HasValue)
         {
@@ -163,7 +176,9 @@ sealed class TrayAppContext : ApplicationContext
             if (u.WeeklyResetMin.HasValue) s += $"（{FmtMin(u.WeeklyResetMin.Value)}）";
             parts.Add(s);
         }
-        return parts.Count == 0 ? $"{name}：额度未知" : $"{name}　" + string.Join("　", parts);
+        if (parts.Count == 0) return $"{name}：额度未知";
+        var result = $"{name}　" + string.Join("　", parts);
+        return u.Error == null ? result : result + $"　（缓存：{u.Error}）";
     }
 
     static string FmtMin(int min)

@@ -1,5 +1,6 @@
 firmware/.pio/
 firmware/.pio-venv/
+firmware/.flash-tools/
 mac-app/.build/
 windows-app/**/bin/
 windows-app/**/obj/

@@ -10,6 +10,8 @@
 - **右键托盘图标** → 控制菜单：Claude/Codex 完整额度（5h/周 + 重置倒计时）、
   自动查找并配对设备、设置设备地址、屏幕显示模式、petdex 桌宠画廊、恢复默认动画、
   把本机设为设备桥接、桥接服务地址
+- **跟随 Windows 锁屏** → 锁定/睡眠时临时关闭设备背光，解锁/恢复时自动点亮；
+  不改变用户亮度，掉线重连或设备重启后会从 `/status` 自动校正
 - 本地 HTTP 服务 `0.0.0.0:8765`：`/status`、`/net`、`/music`、`/music/cover.raw`、
   `/music/text.raw`、`POST /event`（Claude Code / Codex hooks 秒级状态推送）
 - 数据来源同 Mac 版：`%USERPROFILE%\.claude\projects` / `%USERPROFILE%\.codex\sessions`

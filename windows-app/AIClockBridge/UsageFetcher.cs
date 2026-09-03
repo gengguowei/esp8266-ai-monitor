@@ -21,6 +21,8 @@ class ProviderUsage
     public string Error;
     public DateTime? FetchedAt;
     public bool RateLimited;
+    public int? RetryAfterSeconds;
+    public bool AuthenticationError;
 }
 
 sealed class UsageFetcher
@@ -91,11 +93,18 @@ sealed class UsageFetcher
                 mergedClaude = _claude;
                 mergedCodex = _codex;
                 _fetching = false;
-                var backoff = claude.RateLimited ? RateLimitBackoff : MinFetchInterval;
+                var backoff = claude.RateLimited
+                    ? TimeSpan.FromSeconds(Math.Max(
+                        (int)RateLimitBackoff.TotalSeconds,
+                        claude.RetryAfterSeconds ?? 0))
+                    : MinFetchInterval;
                 _nextAllowedFetch = DateTime.UtcNow + backoff;
             }
-            SaveCache(mergedClaude, ClaudeCacheKey);
-            SaveCache(mergedCodex, CodexCacheKey);
+            // Only a successful response may advance the persisted cache age.
+            // Re-saving merged stale data after an error made an old value look
+            // freshly fetched forever.
+            if (claude.FetchedAt.HasValue) SaveCache(mergedClaude, ClaudeCacheKey);
+            if (codex.FetchedAt.HasValue) SaveCache(mergedCodex, CodexCacheKey);
             if (claude.Error != null) Console.Error.WriteLine($"[usage] claude: {claude.Error}");
             if (codex.Error != null) Console.Error.WriteLine($"[usage] codex: {codex.Error}");
             if (_ui != null) _ui.Post(_ => OnUpdate?.Invoke(), null);
@@ -109,13 +118,15 @@ sealed class UsageFetcher
     /// reloaded later still resolves to a correct remaining time.
     static void SaveCache(ProviderUsage u, string key)
     {
-        if (u.PrimaryPct == null && u.WeeklyPct == null) return;
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var dict = new Dictionary<string, double> { ["at"] = now };
+        if ((u.PrimaryPct == null && u.WeeklyPct == null) || !u.FetchedAt.HasValue) return;
+        var fetchedAt = new DateTimeOffset(u.FetchedAt.Value.ToUniversalTime()).ToUnixTimeSeconds();
+        var dict = new Dictionary<string, double> { ["at"] = fetchedAt };
         if (u.PrimaryPct.HasValue) dict["pPct"] = u.PrimaryPct.Value;
-        if (u.PrimaryResetMin.HasValue) dict["pResetAt"] = now + u.PrimaryResetMin.Value * 60.0;
+        if (u.PrimaryResetMin.HasValue)
+            dict["pResetAt"] = fetchedAt + u.PrimaryResetMin.Value * 60.0;
         if (u.WeeklyPct.HasValue) dict["wPct"] = u.WeeklyPct.Value;
-        if (u.WeeklyResetMin.HasValue) dict["wResetAt"] = now + u.WeeklyResetMin.Value * 60.0;
+        if (u.WeeklyResetMin.HasValue)
+            dict["wResetAt"] = fetchedAt + u.WeeklyResetMin.Value * 60.0;
         try { Settings.Set(key, JsonSerializer.Serialize(dict)); }
         catch { /* best effort */ }
     }
@@ -145,7 +156,9 @@ sealed class UsageFetcher
 
     static ProviderUsage Merge(ProviderUsage old, ProviderUsage fresh)
     {
-        if (fresh.PrimaryPct == null && fresh.WeeklyPct == null && old.PrimaryPct != null)
+        if (!fresh.AuthenticationError
+            && fresh.PrimaryPct == null && fresh.WeeklyPct == null
+            && (old.PrimaryPct != null || old.WeeklyPct != null))
         {
             return new ProviderUsage
             {
@@ -155,6 +168,8 @@ sealed class UsageFetcher
                 WeeklyResetMin = old.WeeklyResetMin,
                 FetchedAt = old.FetchedAt,
                 Error = fresh.Error,
+                RateLimited = fresh.RateLimited,
+                RetryAfterSeconds = fresh.RetryAfterSeconds,
             };
         }
         return fresh;
@@ -165,15 +180,23 @@ sealed class UsageFetcher
     static async Task<ProviderUsage> FetchClaude()
     {
         var usage = new ProviderUsage();
-        var token = ClaudeAccessToken();
-        if (token == null)
+        var credential = ClaudeCredential();
+        if (credential == null)
         {
             usage.Error = "未找到 Claude Code 登录凭据（~/.claude/.credentials.json）";
+            usage.AuthenticationError = true;
+            return usage;
+        }
+        if (credential.Value.ExpiresAt.HasValue
+            && credential.Value.ExpiresAt.Value <= DateTimeOffset.UtcNow)
+        {
+            usage.Error = "Claude 凭据已过期，请运行 claude auth login 重新登录";
+            usage.AuthenticationError = true;
             return usage;
         }
         using var req = new HttpRequestMessage(HttpMethod.Get,
             "https://api.anthropic.com/api/oauth/usage");
-        req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {credential.Value.AccessToken}");
         req.Headers.TryAddWithoutValidation("Accept", "application/json");
         req.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
         req.Headers.TryAddWithoutValidation("User-Agent", "claude-code/2.1.0");
@@ -185,6 +208,7 @@ sealed class UsageFetcher
             using var resp = await Http.SendAsync(req);
             code = (int)resp.StatusCode;
             body = await resp.Content.ReadAsStringAsync();
+            if (code == 429) usage.RetryAfterSeconds = RetryAfterSeconds(resp);
         }
         catch (Exception ex)
         {
@@ -194,6 +218,7 @@ sealed class UsageFetcher
         if (code != 200)
         {
             usage.RateLimited = code == 429;
+            usage.AuthenticationError = code == 401 || code == 403;
             usage.Error = code == 401 ? "Claude 凭据过期，运行 claude 重新登录"
                 : code == 429 ? "Claude 用量接口限流，稍后自动重试"
                 : $"Claude 用量接口 HTTP {code}";
@@ -224,7 +249,7 @@ sealed class UsageFetcher
 
     /// Claude Code on Windows stores OAuth credentials as a plain JSON file:
     /// {"claudeAiOauth":{"accessToken":…}}
-    static string ClaudeAccessToken()
+    static (string AccessToken, DateTimeOffset? ExpiresAt)? ClaudeCredential()
     {
         var credFile = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -237,13 +262,36 @@ sealed class UsageFetcher
                 && token.ValueKind == JsonValueKind.String)
             {
                 var t = token.GetString();
-                return string.IsNullOrEmpty(t) ? null : t;
+                if (string.IsNullOrEmpty(t)) return null;
+                DateTimeOffset? expiresAt = null;
+                if (oauth.TryGetProperty("expiresAt", out var expires))
+                {
+                    long epochMs;
+                    if ((expires.ValueKind == JsonValueKind.Number && expires.TryGetInt64(out epochMs))
+                        || (expires.ValueKind == JsonValueKind.String
+                            && long.TryParse(expires.GetString(), out epochMs)))
+                    {
+                        try { expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(epochMs); }
+                        catch (ArgumentOutOfRangeException) { }
+                    }
+                }
+                return (t, expiresAt);
             }
         }
         catch
         {
             // missing / unreadable
         }
+        return null;
+    }
+
+    static int? RetryAfterSeconds(HttpResponseMessage response)
+    {
+        var retry = response.Headers.RetryAfter;
+        if (retry?.Delta is TimeSpan delta)
+            return Math.Max(0, (int)Math.Ceiling(delta.TotalSeconds));
+        if (retry?.Date is DateTimeOffset date)
+            return Math.Max(0, (int)Math.Ceiling((date - DateTimeOffset.UtcNow).TotalSeconds));
         return null;
     }
 

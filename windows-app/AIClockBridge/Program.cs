@@ -33,6 +33,8 @@ static class Program
         service.MusicPlayingProvider = () => nowPlaying.Snapshot.Playing;
         var stockMonitor = new StockMonitor();
         stockMonitor.Start();
+        using var screenPower = new WindowsScreenPowerController();
+        service.ScreenOnProvider = () => screenPower.ScreenOn;
 
         var server = new MiniHttpServer(Port,
             routes: new()
@@ -107,7 +109,8 @@ static class Program
             Console.Error.WriteLine($"[bridge] failed to bind port {Port}: {e.Message}");
         }
 
-        var context = new TrayAppContext(service, usage, netMonitor, nowPlaying, stockMonitor, Port);
+        var context = new TrayAppContext(
+            service, usage, netMonitor, nowPlaying, stockMonitor, screenPower, Port);
         usage.StartAutoRefresh();
         Application.Run(context);
     }

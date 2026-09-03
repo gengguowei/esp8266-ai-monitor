@@ -40,6 +40,8 @@
 
 用 Chrome / Edge 打开 **[mac.qust.me/#flash](https://mac.qust.me/#flash)**，USB 连接设备，点「连接设备并烧录」，选择串口等待完成即可，无需安装任何工具。
 
+仓库开发环境在 Windows 上也可运行 `powershell -ExecutionPolicy Bypass -File .\firmware\flash-windows.ps1`；脚本会确认 ESP8266/4MB Flash、先做完整备份，再写入并校验固件。
+
 > 弹窗里看不到串口？Windows 需要装 [CH340 驱动](https://www.wch.cn/downloads/CH341SER_EXE.html)，Mac 系统自带无需安装；换根 USB 线（很多线只能充电）；更多排查见[官网 FAQ](https://mac.qust.me/#flash-faq)。
 >
 > 命令行党也可以用 esptool 把 [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) 里的 `esp8266-ai-firmware-*.bin` 刷到 `0x0`。

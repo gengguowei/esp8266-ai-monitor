@@ -196,12 +196,20 @@ bool webServerStarted = false; // deferred: port 80 clashes with the portal
 // The panel backlight (TFT_BL, active LOW) is PWM-dimmable — the vendor's own
 // firmware does the same. 0 = off, 100 = full. Persisted so it survives reboot.
 
-int brightness = BRIGHTNESS_DEFAULT; // 0-100
+int brightness = BRIGHTNESS_DEFAULT; // persisted user level, 0-100
+bool screenPowerOn = true;            // transient host lock/suspend state
 
 void applyBrightness() {
   // analogWriteRange(100) is set in setup(), so the duty value is just the
   // inverted percentage (active LOW: 0 duty = always LOW = full on).
-  analogWrite(TFT_BL, 100 - brightness);
+  int outputBrightness = screenPowerOn ? brightness : 0;
+  analogWrite(TFT_BL, 100 - outputBrightness);
+}
+
+void setScreenPower(bool on) {
+  if (screenPowerOn == on) return;
+  screenPowerOn = on;
+  applyBrightness();
 }
 
 void loadBrightness() {
@@ -1491,6 +1499,12 @@ bool parseStatusJson(const String &payload) {
   DeserializationError err = deserializeJson(doc, payload);
   if (err) return false;
 
+  // Optional for backwards compatibility with older bridge clients. Unlike
+  // brightness this is deliberately transient and is never written to flash.
+  if (doc["screen_on"].is<bool>()) {
+    setScreenPower(doc["screen_on"].as<bool>());
+  }
+
   JsonObject c = doc["claude"];
   if (!c.isNull()) {
     claudeStatus.status = c["status"] | "unknown";
@@ -1780,6 +1794,7 @@ void handleApiInfo() {
   doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
   doc["sprite_rev"] = spriteRev;
   doc["brightness"] = brightness;
+  doc["screen_on"] = screenPowerOn;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
   JsonObject c = doc["claude"].to<JsonObject>();
@@ -1839,6 +1854,24 @@ void handleApiBrightness() {
   applyBrightness();
   saveBrightness();
   Serial.printf("[api] brightness = %d\n", brightness);
+  webServer.send(200, "text/plain", "ok");
+}
+
+void handleApiScreen() {
+  String onArg = webServer.arg("on");
+  onArg.toLowerCase();
+  bool on;
+  if (onArg == "1" || onArg == "true" || onArg == "on") {
+    on = true;
+  } else if (onArg == "0" || onArg == "false" || onArg == "off") {
+    on = false;
+  } else {
+    webServer.send(400, "text/plain", "missing or invalid on (0|1)");
+    return;
+  }
+  setScreenPower(on);
+  Serial.printf("[api] screen power = %s (brightness remains %d)\n",
+                screenPowerOn ? "on" : "off", brightness);
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -2139,6 +2172,7 @@ void setupWebServer() {
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
+  webServer.on("/api/screen", HTTP_POST, handleApiScreen);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
   webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
   webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });

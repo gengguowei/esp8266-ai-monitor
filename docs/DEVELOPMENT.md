@@ -130,6 +130,25 @@ pip install platformio
 pio run -t upload          # 已验证：编译成功，Flash 45.7%，RAM 39.7%
 ```
 
+Windows 上可以复用仓库内已经实机验证的刷写脚本：
+
+```powershell
+# 自动选择唯一的 USB 串口、备份完整 4MB Flash、写入并校验
+powershell -ExecutionPolicy Bypass -File .\firmware\flash-windows.ps1
+
+# 多串口时明确指定；也可手动指定 BIN
+powershell -ExecutionPolicy Bypass -File .\firmware\flash-windows.ps1 `
+  -Port COM4 -FirmwarePath .\dist\firmware-0.4.12.bin
+
+# 只确认芯片和 Flash 容量，不执行备份或写入
+powershell -ExecutionPolicy Bypass -File .\firmware\flash-windows.ps1 -VerifyOnly
+```
+
+脚本固定使用已验证的 ESP8266EX / 4MB / DIO / 40MHz 参数，默认先把完整 Flash 备份到
+`dist/backup-esp8266-before-flash-*.bin`，随后只覆盖地址 `0x000000` 开始的应用固件，
+不会执行 `erase_flash`，所以 LittleFS、WiFi、亮度和自定义动画配置均会保留。首次运行会把
+`esptool 3.0` 安装到被 Git 忽略的 `firmware/.flash-tools/`，后续直接复用。
+
 烧录后串口会打印调试日志（这版固件不再是"静默"的）：
 
 ```
@@ -199,11 +218,15 @@ pio device monitor -b 115200
 | GET | `/api/info` | 设备状态 JSON：ip/ssid/bridge/显示模式/当前显示/自定义精灵标记 |
 | POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
 | POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
+| POST | `/api/brightness` | `level=0-100` 设置并持久化用户亮度 |
+| POST | `/api/screen` | `on=0\|1` 临时关闭/恢复背光，不修改或持久化用户亮度 |
 | POST | `/sprite/claude`、`/sprite/codex` | multipart 上传 GIF 并板上解码替换 |
 | POST | `/sprite/claude/reset`、`/sprite/codex/reset` | 删除自定义动画，恢复内置形象 |
 | GET | `/sprite/claude/raw`、`/sprite/codex/raw` | 当前生效动画的原始帧流 `[1B帧数][RGB565大端帧...]`（镜像窗口用）|
 
 `/api/info` 里的 `sprite_rev` 在每次上传/重置动画后自增，镜像端据此决定是否重新拉帧。
+`screen_on` 表示临时背光开关；Windows 桥接还会在 `/status` 中持续下发该字段，使设备
+重启或网络短暂中断后能够重新跟随 Windows 锁屏状态。
 
 ## 5. 网速曲线页（Mac + 设备同步显示）
 

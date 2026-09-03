@@ -134,6 +134,11 @@ static class DeviceClient
     public static Task SetBrightness(int level) =>
         PostForm("api/brightness", new() { ["level"] = level.ToString() });
 
+    /// POST /api/screen  on=0|1. This is transient and deliberately separate
+    /// from brightness, so locking Windows never overwrites the user's level.
+    public static Task SetScreenPower(bool on) =>
+        PostForm("api/screen", new() { ["on"] = on ? "1" : "0" });
+
     /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
     /// and rescales the GIF on-board, then swaps the animation immediately.
     public static async Task UploadGif(byte[] gif, string slot)
