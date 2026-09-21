@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Firmware flashing GUI for the SD2 ESP8266 board. Replaces the
+       setup-firmware-env / flash-step1 / flash-step2 script chain in dist\:
+       the ESP8266 download protocol is implemented in Esp\EspLoader.cs, so
+       this needs no Python, no pip install esptool, and no firmware\.flash-tools.
+       WinForms, same toolchain as AIClockBridge; EnableWindowsTargeting keeps
+       it building on non-Windows hosts for CI. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>AIClockFlasher</AssemblyName>
+    <RootNamespace>AIClockFlasher</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Product>AIClockFlasher</Product>
+    <Company>esp8266-ai</Company>
+    <Description>AI Clock Flasher - firmware flashing and rollback tool for the SD2 ESP8266 display</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Espressif's ESP8266 flasher stub, verbatim from esptool-js (Apache-2.0).
+         Required: the ESP8266 ROM cannot read flash at all, so there is no
+         backup-before-flash without it. See Assets\STUB-LICENSE.txt. -->
+    <EmbeddedResource Include="Assets\stub_flasher_8266.json" />
+  </ItemGroup>
+
+</Project>

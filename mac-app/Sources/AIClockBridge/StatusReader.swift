@@ -34,7 +34,6 @@ struct Snapshot {
     var claude: ClaudeStatus
     var codex: CodexStatus
     var ts: Int
-    var musicPlaying: Bool = false
 }
 
 /// Reads the logs and derives status, with a small time cache so back-to-back
@@ -46,10 +45,6 @@ final class StatusService {
     /// Real OAuth quota (5h/weekly windows) merged into snapshots when set;
     /// log-derived values remain the fallback for offline use.
     var usage: UsageFetcher?
-
-    /// Whether audio is playing right now (drives the device's AUTO -> music
-    /// auto-switch). Set from NowPlayingMonitor in main.
-    var musicPlayingProvider: (() -> Bool)?
 
     // Hook-pushed live state (POST /event from Claude Code / Codex hooks).
     // Events beat the mtime heuristic while fresh: "working" for up to 10min
@@ -193,7 +188,6 @@ final class StatusService {
         snap.codex.status = overrideStatus(snap.codex.status, with: codexEvent, now: now)
         snap.claude.needsInput = needsInput(claudeNeedsInputAt, now: now)
         snap.codex.needsInput = needsInput(codexNeedsInputAt, now: now)
-        snap.musicPlaying = musicPlayingProvider?() ?? false
         return snap
     }
 
@@ -358,7 +352,6 @@ extension Snapshot {
         func num(_ v: Double?) -> Any { v.map { $0 as Any } ?? NSNull() }
         let dict: [String: Any] = [
             "ts": ts,
-            "music_playing": musicPlaying,
             "claude": [
                 "status": claude.status,
                 "tokens_today": claude.tokensToday,

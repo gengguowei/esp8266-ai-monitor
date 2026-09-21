@@ -39,10 +39,6 @@ let usage = UsageFetcher()
 service.usage = usage
 let netMonitor = NetSpeedMonitor()
 netMonitor.start()
-let nowPlaying = NowPlayingMonitor()
-nowPlaying.start()
-service.musicPlayingProvider = { nowPlaying.snapshot.playing }
-
 let stockMonitor = StockMonitor()
 stockMonitor.start()
 
@@ -58,11 +54,8 @@ let server = HTTPServer(port: port, routes: [
         let stats = SystemStatsMonitor.shared.snapshot()
         return netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)
     },
-    "/music": { nowPlaying.jsonData() },
     "/stock": { stockMonitor.jsonData() },
 ], binaryRoutes: [
-    "/music/cover.raw": { nowPlaying.coverRGB565 },
-    "/music/text.raw": { nowPlaying.textRGB565 },
     "/stock/names.raw": { stockMonitor.namesRGB565() },
 ], postRoutes: [
     // Claude Code / Codex hooks push lifecycle events here (see README §7):
@@ -80,7 +73,7 @@ let server = HTTPServer(port: port, routes: [
 // Remember it (for auto-pairing / DHCP-change self-healing) and adopt it
 // outright when no device is configured yet.
 server.onRequest = { path, ip in
-    guard path == "/status" || path == "/net" || path == "/music",
+    guard path == "/status" || path == "/net" || path == "/stock",
           ip != "127.0.0.1", ip != "::1", !ip.isEmpty else { return }
     DeviceClient.devicePollAt = Date()
     DeviceClient.lastSeenIP = ip
@@ -103,7 +96,7 @@ do {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,
-                                nowPlaying: nowPlaying, stockMonitor: stockMonitor, port: port)
+                                stockMonitor: stockMonitor, port: port)
 _ = menuBar // retain
 usage.startAutoRefresh()
 app.run()

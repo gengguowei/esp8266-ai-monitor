@@ -8,8 +8,8 @@ struct DeviceInfo {
     var ip = ""
     var ssid = ""
     var bridge = ""
-    var mode = "auto"       // configured: auto | claude | codex | net | music
-    var effective = "auto"  // what's actually on screen (AUTO may promote to music)
+    var mode = "auto"       // configured: auto | claude | codex | net | stock
+    var effective = "auto"
     var showing = ""
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
     var spriteRev = 0       // bumped by the device on animation change
@@ -81,7 +81,7 @@ final class DeviceClient {
         }.resume()
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music
+    /// POST /api/display  mode=auto|claude|codex|net|stock
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
@@ -289,7 +289,7 @@ final class DeviceClient {
 
     // MARK: - pairing watchdog
 
-    /// Stamped on every device poll of our /status|/net|/music (see main.swift).
+    /// Stamped on every device poll of our /status|/net|/stock (see main.swift).
     static var devicePollAt = Date.distantPast
 
     private static var healInFlight = false

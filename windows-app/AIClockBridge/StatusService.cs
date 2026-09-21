@@ -40,7 +40,6 @@ class StatusSnapshot
     public ClaudeStatus Claude = new();
     public CodexStatus Codex = new();
     public long Ts;
-    public bool MusicPlaying;
     public bool ScreenOn = true;
 
     /// Serializes to the exact JSON shape the firmware's parseStatusJson expects.
@@ -51,7 +50,6 @@ class StatusSnapshot
         {
             w.WriteStartObject();
             w.WriteNumber("ts", Ts);
-            w.WriteBoolean("music_playing", MusicPlaying);
             w.WriteBoolean("screen_on", ScreenOn);
             w.WriteStartObject("claude");
             w.WriteString("status", Claude.Status);
@@ -106,7 +104,6 @@ class StatusSnapshot
             Claude = (ClaudeStatus)Claude.MemberwiseCloneOf(),
             Codex = (CodexStatus)Codex.MemberwiseCloneOf(),
             Ts = Ts,
-            MusicPlaying = MusicPlaying,
             ScreenOn = ScreenOn,
         };
     }
@@ -127,18 +124,21 @@ static class CloneHelper
 /// HTTP polls and the mirror timer don't each re-scan the whole tree.
 sealed class StatusService
 {
-    readonly string _claudeDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
-    readonly string _codexDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "sessions");
+    readonly string _claudeDir;
+    readonly string _codexDir;
+
+    public StatusService(string claudeDir = null, string codexDir = null)
+    {
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var config = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+        _claudeDir = claudeDir ?? Path.Combine(string.IsNullOrWhiteSpace(config)
+            ? Path.Combine(profile, ".claude") : config, "projects");
+        _codexDir = codexDir ?? Path.Combine(profile, ".codex", "sessions");
+    }
 
     /// Real OAuth quota (5h/weekly windows) merged into snapshots when set;
     /// log-derived values remain the fallback for offline use.
     public UsageFetcher Usage;
-
-    /// Whether audio is playing right now (drives the device's AUTO -> music
-    /// auto-switch). Set from NowPlayingMonitor in Program.
-    public Func<bool> MusicPlayingProvider;
 
     /// Whether the device backlight should be temporarily enabled. Windows
     /// session lock/suspend state supplies this without changing user brightness.
@@ -153,6 +153,7 @@ sealed class StatusService
 
     AgentEvent _claudeEvent;
     AgentEvent _codexEvent;
+    readonly Dictionary<string, (AgentEvent Event, double? Attention)> _claudeSessions = new();
     // "needs input": a permission/approval prompt is on screen, waiting on the
     // user. Set by an attention event, cleared by the next concrete lifecycle
     // event (the prompt got answered) or by TTL.
@@ -182,11 +183,27 @@ sealed class StatusService
 
     /// Called by the /event endpoint. Unknown event names are ignored.
     /// `message` is only sent for Claude's Notification hook.
-    public void RecordEvent(string agent, string ev, string message = null)
+    public void RecordEvent(string agent, string ev, string message = null, string sessionId = null)
     {
         lock (_lock)
         {
             var now = Now();
+            if (agent == "claude" && !string.IsNullOrWhiteSpace(sessionId))
+            {
+                foreach (var key in _claudeSessions.Where(p => now - p.Value.Event.At > IdleThreshold)
+                    .Select(p => p.Key).ToArray()) _claudeSessions.Remove(key);
+                if (ev == "SessionEnd") { _claudeSessions.Remove(sessionId); return; }
+                var attention = AttentionEvents.Contains(ev)
+                    || (ev == "Notification" && IsPermissionNotification(message));
+                if (!attention && !WorkingEvents.Contains(ev) && !IdleEvents.Contains(ev)
+                    && ev != "StopFailure" && ev != "PostToolUseFailure" && ev != "ElicitationResult") return;
+                if (_claudeSessions.Count >= 256 && !_claudeSessions.ContainsKey(sessionId)) return;
+                _claudeSessions.TryGetValue(sessionId, out var previous);
+                var sessionState = attention ? previous.Event?.State ?? "idle"
+                    : IdleEvents.Contains(ev) || ev == "StopFailure" ? "idle" : "working";
+                _claudeSessions[sessionId] = (new AgentEvent(sessionState, now), attention ? now : null);
+                return;
+            }
             // Claude Notification: flash only for permission prompts, not for
             // "task done / waiting for your input" notifications.
             if (ev == "Notification")
@@ -225,7 +242,7 @@ sealed class StatusService
         if (ev == null) return logStatus;
         var age = now - ev.At;
         if (ev.State == "working" && age < WorkingEventTTL) return "working";
-        if (ev.State == "idle" && age < IdleEventTTL && logStatus == "working") return "idle";
+        if (ev.State == "idle" && age < IdleEventTTL) return "idle";
         return logStatus;
     }
 
@@ -262,9 +279,9 @@ sealed class StatusService
             if (Usage != null)
             {
                 var cu = Usage.Claude;
-                snap.Claude.FiveHourPct = cu.PrimaryPct;
+                snap.Claude.FiveHourPct = cu.DesktopStale ? null : cu.PrimaryPct;
                 snap.Claude.FiveHourResetMin = cu.PrimaryResetMin;
-                snap.Claude.SevenDayPct = cu.WeeklyPct;
+                snap.Claude.SevenDayPct = cu.DesktopStale ? null : cu.WeeklyPct;
                 snap.Claude.SevenDayResetMin = cu.WeeklyResetMin;
                 var xu = Usage.Codex;
                 if (xu.PrimaryPct.HasValue)
@@ -281,8 +298,15 @@ sealed class StatusService
             snap.Claude.Status = OverrideStatus(snap.Claude.Status, _claudeEvent, now);
             snap.Codex.Status = OverrideStatus(snap.Codex.Status, _codexEvent, now);
             snap.Claude.NeedsInput = NeedsInput(_claudeNeedsInputAt, now);
+            var sessions = _claudeSessions.Values.Where(s => now - s.Event.At < IdleThreshold).ToArray();
+            if (sessions.Length > 0)
+            {
+                if (sessions.Any(s => s.Event.State == "working" && now - s.Event.At < WorkingEventTTL))
+                    snap.Claude.Status = "working";
+                else if (snap.Claude.Status == "offline") snap.Claude.Status = "idle";
+                snap.Claude.NeedsInput |= sessions.Any(s => NeedsInput(s.Attention, now));
+            }
             snap.Codex.NeedsInput = NeedsInput(_codexNeedsInputAt, now);
-            snap.MusicPlaying = MusicPlayingProvider?.Invoke() ?? false;
             snap.ScreenOn = ScreenOnProvider?.Invoke() ?? true;
             return snap;
         }

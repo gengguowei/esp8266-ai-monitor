@@ -42,28 +42,6 @@ private func decodeSpriteFrames(_ data: Data, w: Int, h: Int) -> [CGImage] {
     return frames
 }
 
-private func decodeCover(_ data: Data, w: Int, h: Int) -> CGImage? {
-    let frameBytes = w * h * 2
-    guard data.count >= frameBytes else { return nil }
-    let bytes = [UInt8](data)
-    var rgba = [UInt8](repeating: 255, count: w * h * 4)
-    var src = 0
-    for p in 0..<(w * h) {
-        let v = (UInt16(bytes[src]) << 8) | UInt16(bytes[src + 1])
-        src += 2
-        rgba[p * 4 + 0] = UInt8((v >> 11) & 0x1F) << 3
-        rgba[p * 4 + 1] = UInt8((v >> 5) & 0x3F) << 2
-        rgba[p * 4 + 2] = UInt8(v & 0x1F) << 3
-    }
-    let data = CFDataCreate(nil, rgba, rgba.count)!
-    guard let provider = CGDataProvider(data: data) else { return nil }
-    return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                   bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                   provider: provider, decode: nil, shouldInterpolate: false,
-                   intent: .defaultIntent)
-}
-
 // MARK: - the 240x240 replica view
 
 final class MirrorView: NSView {
@@ -110,14 +88,6 @@ final class MirrorView: NSView {
         max(maxV * 1.15, 10240)
     }
 
-    var musicMode = false
-    var musicTitle = ""
-    var musicArtist = ""
-    var musicElapsed: Double = 0
-    var musicDuration: Double = 0
-    var musicPlaying = false
-    var musicCover: CGImage?
-
     private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
     private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
 
@@ -138,11 +108,6 @@ final class MirrorView: NSView {
 
         if netMode {
             drawNetScene(ctx)
-            ctx.restoreGState()
-            return
-        }
-        if musicMode {
-            drawMusicScene(ctx)
             ctx.restoreGState()
             return
         }
@@ -223,51 +188,6 @@ final class MirrorView: NSView {
             NSRect(x: 240 - m - t, y: m, width: t, height: side).fill()
         }
         ctx.restoreGState()
-    }
-
-    private func drawMusicScene(_ ctx: CGContext) {
-        let coverRect = CGRect(x: 56, y: 16, width: 128, height: 128)
-        if let musicCover {
-            ctx.saveGState()
-            ctx.interpolationQuality = .none
-            ctx.translateBy(x: 0, y: coverRect.midY)
-            ctx.scaleBy(x: 1, y: -1)
-            ctx.translateBy(x: 0, y: -coverRect.midY)
-            ctx.draw(musicCover, in: coverRect)
-            ctx.restoreGState()
-        } else {
-            ctx.setFillColor(NSColor.darkGray.cgColor)
-            ctx.fill(coverRect)
-            let style = NSMutableParagraphStyle()
-            style.alignment = .center
-            ("No Art" as NSString).draw(in: NSRect(x: 56, y: 72, width: 128, height: 20), withAttributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
-                .foregroundColor: NSColor.lightGray,
-                .paragraphStyle: style,
-            ])
-        }
-
-        let titleStyle = NSMutableParagraphStyle()
-        titleStyle.alignment = .center
-        titleStyle.lineBreakMode = .byTruncatingTail
-        let title = musicTitle.isEmpty ? "No Music" : musicTitle
-        (title as NSString).draw(in: NSRect(x: 12, y: 154, width: 216, height: 24), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 15, weight: .bold),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: titleStyle,
-        ])
-        (musicArtist as NSString).draw(in: NSRect(x: 12, y: 178, width: 216, height: 20), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.lightGray,
-            .paragraphStyle: titleStyle,
-        ])
-
-        let bar = CGRect(x: 20, y: 210, width: 200, height: 8)
-        ctx.setFillColor(NSColor.darkGray.cgColor)
-        ctx.fill(bar)
-        let frac = musicDuration > 0 ? max(0, min(1, musicElapsed / musicDuration)) : 0
-        ctx.setFillColor((musicPlaying ? NSColor.systemGreen : NSColor.gray).cgColor)
-        ctx.fill(CGRect(x: bar.minX, y: bar.minY, width: bar.width * frac, height: bar.height))
     }
 
     /// Replica of the firmware's net-speed screen v2: header readouts, then
@@ -436,11 +356,10 @@ final class MirrorView: NSView {
 final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
-    private let nowPlaying: NowPlayingMonitor
     private let stockMonitor: StockMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "股票"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
@@ -458,11 +377,9 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var lastInfo: DeviceInfo?
     private var fetchingSlot: String?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
-         stockMonitor: StockMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor) {
         self.service = service
         self.netMonitor = netMonitor
-        self.nowPlaying = nowPlaying
         self.stockMonitor = stockMonitor
         super.init()
         popover.behavior = .transient
@@ -597,11 +514,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.ensureSprite(info)
                 self.syncBrightness(info)
                 let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5][info.mode] ?? 0
+                               "stock": 4][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
-                    : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放" : "固定显示"
+                    : info.mode == "net" ? "网速曲线" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
@@ -623,11 +539,8 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
     /// Quota lines & ring exactly as the firmware computes them from /status.
     private func applyScene(_ info: DeviceInfo) {
-        // mirror what's actually on the device screen (effective), so an
-        // AUTO device that auto-switched to music shows music here too
         let enteringNet = info.effective == "net" && !mirror.netMode
         mirror.netMode = info.effective == "net"
-        mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
@@ -636,17 +549,6 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         }
         if mirror.netMode {
             if enteringNet { mirror.resetNetSweep() } // fresh sweep, like the device's chrome reset
-            mirror.needsDisplay = true
-            return
-        }
-        if mirror.musicMode {
-            let s = nowPlaying.snapshot
-            mirror.musicTitle = s.title
-            mirror.musicArtist = s.artist
-            mirror.musicElapsed = s.elapsed
-            mirror.musicDuration = s.duration
-            mirror.musicPlaying = s.playing
-            mirror.musicCover = decodeCover(nowPlaying.coverRGB565, w: 128, h: 128)
             mirror.needsDisplay = true
             return
         }
@@ -741,7 +643,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "net", "stock"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

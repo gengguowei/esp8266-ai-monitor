@@ -1,8 +1,8 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <!-- Windows port of mac-app/: same tray-icon bridge (status server, screen
-       mirror, quota, net speed, now-playing, petdex picker). WinForms + WinRT
-       media APIs; ImageSharp is the one third-party dep, needed because
+       mirror, quota, net speed, stock data, petdex picker). WinForms;
+       ImageSharp is the one third-party dep, needed because
        System.Drawing cannot decode petdex's WebP spritesheets nor author
        multi-frame GIFs. EnableWindowsTargeting lets the project compile on
        non-Windows hosts too (CI / cross-checks); it only runs on Windows. -->
@@ -19,8 +19,27 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
+  <!-- Release version. Single source of truth: build-release.ps1 reads
+       <Version> from this file to name dist\AIClockBridge-<Version>-Windows-x64.
+
+       The Windows bridge versions INDEPENDENTLY of the firmware (which tracks
+       FW_VERSION in firmware/include/config.h). The two used to move in step;
+       they no longer do, because bridge-only work - autostart, single instance,
+       quota-cache fixes - ships without touching the device at all and leaves
+       the device protocol unchanged. 0.5.0 is where the two lines split.
+
+       To release: bump this, add a CHANGELOG.md entry, run build-release.ps1.
+       The payload folder name follows automatically. -->
+  <PropertyGroup>
+    <Version>0.5.4</Version>
+    <Product>AIClockBridge</Product>
+    <Company>esp8266-ai</Company>
+    <Description>AI Clock Bridge - tray bridge for the SD2 ESP8266 status display</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
   </ItemGroup>
 
   <ItemGroup>

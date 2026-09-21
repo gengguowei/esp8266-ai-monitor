@@ -45,7 +45,9 @@ sealed class StockMonitor
         return prefix + body;
     }
 
-    static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(5) };
+    // Rebuildable for the same reason as the quota client: a proxy toggled while
+    // we run would otherwise freeze the quotes until the process restarts.
+    static readonly ResilientHttpClient Http = new("stock", TimeSpan.FromSeconds(5));
     static readonly Encoding Gbk;
 
     static StockMonitor()
@@ -61,8 +63,30 @@ sealed class StockMonitor
     Row[] _rows = Array.Empty<Row>();
     System.Threading.Timer _timer;
 
+    /// Last failure, or null while healthy. Quotes used to fail into a bare
+    /// `catch {}`: the previous rows stayed on screen and nothing anywhere said
+    /// they had stopped updating, which is exactly how a proxy outage went
+    /// unnoticed. The tray now shows this.
+    string _error;
+    string _namesError;
+    DateTime? _fetchedAt;
+
+    public string Error { get { lock (_lock) return _error ?? _namesError; } }
+    public DateTime? FetchedAt { get { lock (_lock) return _fetchedAt; } }
+
+    /// Diagnostic for "prices update but the device shows no Chinese names":
+    /// 0 means no strips have ever been rendered, so there is nothing for the
+    /// device to fetch and the fault is on this side.
+    public int NamesRev { get { lock (_lock) return _namesRev; } }
+    public int NamesBytes { get { lock (_lock) return _namesData?.Length ?? 0; } }
+
+    /// The 5s timer and the 5s HTTP timeout are the same number, so a slow proxy
+    /// used to pile overlapping fetches on top of each other - and an older
+    /// response could land after a newer one and roll the prices backwards.
+    int _fetching;
+
     // The device's font is ASCII-only, so CJK company names go down as
-    // rendered RGB565 strips (same trick as the music title strip): one
+    // rendered RGB565 strips: one
     // NameW x NameH strip per row, wire format [1 byte count][strips...].
     // names_rev in /stock tells the device when to re-fetch.
     public const int NameW = 156, NameH = 16;
@@ -103,6 +127,18 @@ sealed class StockMonitor
         get { lock (_lock) return _namesData; }
     }
 
+    /// Revision and payload together, so the serial sender cannot pair a stale
+    /// rev with fresh bytes (or the reverse) when the watchlist changes mid-send.
+    public bool TryGetNames(out int rev, out byte[] data)
+    {
+        lock (_lock)
+        {
+            rev = _namesRev;
+            data = _namesData;
+            return data != null && data.Length > 1;
+        }
+    }
+
     void RenderNamesIfNeeded(Row[] parsed)
     {
         var top = parsed.Take(4).ToArray();
@@ -134,27 +170,72 @@ sealed class StockMonitor
             _lastNamesKey = key;
             _namesData = ms.ToArray();
             _namesRev++;
+            _namesError = null;
+            Log.Write($"[stock] rendered {top.Length} CJK name strips"
+                      + $" ({_namesData.Length} bytes, names_rev={_namesRev});"
+                      + " the device pulls these over HTTP from /stock/names.raw"
+                      + " and needs WiFi plus a bridge host to do it");
         }
     }
 
     async Task Fetch()
     {
-        var symbols = Symbols;
-        if (symbols.Length == 0)
-        {
-            lock (_lock) _rows = Array.Empty<Row>();
-            return;
-        }
+        // One in flight at a time; a tick that arrives while the previous fetch
+        // is still waiting is simply dropped.
+        if (Interlocked.Exchange(ref _fetching, 1) == 1) return;
         try
         {
-            var bytes = await Http.GetByteArrayAsync("http://qt.gtimg.cn/q=" + string.Join(",", symbols));
-            var rows = Parse(Gbk.GetString(bytes), symbols);
-            lock (_lock) _rows = rows;
-            RenderNamesIfNeeded(rows);
+            var symbols = Symbols;
+            if (symbols.Length == 0)
+            {
+                lock (_lock) { _rows = Array.Empty<Row>(); _error = null; }
+                return;
+            }
+            Row[] rows;
+            try
+            {
+                var bytes = await Http.Client.GetByteArrayAsync(
+                    "http://qt.gtimg.cn/q=" + string.Join(",", symbols));
+                Http.ReportSuccess();
+                rows = Parse(Gbk.GetString(bytes), symbols);
+                lock (_lock)
+                {
+                    _rows = rows;
+                    _error = rows.Length == 0 ? "行情响应里没有可用的报价" : null;
+                    _fetchedAt = DateTime.UtcNow;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Keep the previous rows - stale quotes beat a blank tab - but
+                // record why, so a persistent outage is visible instead of
+                // looking like a market that stopped moving.
+                Http.ReportTransportFailure(ex.Message);
+                lock (_lock) _error = $"行情请求失败：{ex.Message}";
+                Log.Write($"[stock] fetch failed: {ex.Message}");
+                return;
+            }
+
+            // Rendering the CJK name strips is GDI work, not network work. Keep
+            // it out of the catch above: a font or GDI failure there would be
+            // reported as a fetch failure, blame the wrong thing, and count
+            // toward the HttpClient rebuild. It is also precisely the failure
+            // that looks like "prices update but the names never appear on the
+            // device", since the device pulls the strips over a separate HTTP
+            // route while prices arrive over the serial link.
+            try
+            {
+                RenderNamesIfNeeded(rows);
+            }
+            catch (Exception ex)
+            {
+                lock (_lock) _namesError = $"中文名称条渲染失败：{ex.Message}";
+                Log.Write($"[stock] name strip render failed: {ex}");
+            }
         }
-        catch
+        finally
         {
-            // transient network error: keep the previous rows
+            Interlocked.Exchange(ref _fetching, 0);
         }
     }
 

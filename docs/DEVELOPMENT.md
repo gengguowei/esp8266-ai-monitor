@@ -31,7 +31,7 @@ tools/        GIF -> RGB565 默认精灵图头文件的转换脚本（改编译�
 
 ## 1. 跑起 Mac 端菜单栏 app
 
-> Windows 用户：功能一致的托盘版见 [`windows-app/README.md`](windows-app/README.md)，
+> Windows 用户：功能一致的托盘版见 [`windows-app/README.md`](../windows-app/README.md)，
 > 本节其余说明（左右键交互、自动配对、数据来源）同样适用。
 
 需要 Xcode / Swift 工具链（macOS 自带 `swift`）。
@@ -57,7 +57,6 @@ swift run                # 前台运行；或 swift build 后跑 .build/debug/AI
   （覆盖"刚配完 WiFi、还没设过桥接"的全新设备）。
 - **设置设备地址…**：手动填时钟的 IP（开机时屏幕会显示；有自动配对后基本用不上）
 - **屏幕显示**：自动（谁在干活显示谁）/ 固定 Claude / 固定 Codex
-- **音乐播放**：显示 Mac 当前播放的专辑封面、歌曲、歌手和进度
 - **更换桌宠动画…**：内置 [petdex.dev](https://petdex.dev) 画廊（3300+ 开源桌宠），
   搜索 → 选动画（待机/跑步/挥手…9 种）→ 预览 → 一键上传到设备
 - **恢复默认动画**：删掉自定义 GIF，回到固件内置形象
@@ -193,7 +192,7 @@ pio device monitor -b 115200
     2 个轮询周期没更新），需要马上看一眼
 - **整圈边框红色闪烁 = 需要你确认操作**：Claude / Codex 弹出权限/审批选择时（Claude
   的 `Notification`、Codex 的 `PermissionRequest` hook），设备整圈边框红色闪烁提醒你去
-  确认；AUTO 模式还会自动切到那个待审批的角色（优先级高于音乐自动切换）。你在 CLI 里
+  确认；AUTO 模式还会自动切到那个待审批的角色。你在 CLI 里
   做出选择后（下一个工具调用/回合事件到达）自动停止闪烁，5 分钟无响应也会自动超时清除。
   Mac 弹窗镜像同步显示红色边框闪烁。
 
@@ -216,7 +215,7 @@ pio device monitor -b 115200
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/info` | 设备状态 JSON：ip/ssid/bridge/显示模式/当前显示/自定义精灵标记 |
-| POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
+| POST | `/api/display` | `mode=auto\|claude\|codex\|net\|stock` 切换屏幕显示（net=网速曲线页，stock=股票页）|
 | POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
 | POST | `/api/brightness` | `level=0-100` 设置并持久化用户亮度 |
 | POST | `/api/screen` | `on=0\|1` 临时关闭/恢复背光，不修改或持久化用户亮度 |
@@ -227,6 +226,20 @@ pio device monitor -b 115200
 `/api/info` 里的 `sprite_rev` 在每次上传/重置动画后自增，镜像端据此决定是否重新拉帧。
 `screen_on` 表示临时背光开关；Windows 桥接还会在 `/status` 中持续下发该字段，使设备
 重启或网络短暂中断后能够重新跟随 Windows 锁屏状态。
+
+### USB 串口数据链路
+
+设备与桌面桥接使用 CH340 串口的 115200 8N1 通道。Windows 端优先按 USB VID/PID
+查找 CH340/CP210x，并用 `#HELLO` / `#DEVICE` 握手确认设备；握手成功后发送：
+
+- `#STATUS {json}`：Claude/Codex 状态、额度和临时背光状态，每 5 秒
+- `#NET {json}`：网速与 CPU/内存样本，每 2 秒
+- `#STOCK {json}`：股票代码、价格和涨跌，每 5 秒
+- `#CMD {json}`：显示模式、亮度和临时背光控制
+
+所有帧以换行结尾。固件在最近 15 秒收到过有效串口帧时停止对应 HTTP 轮询；USB
+拔出或客户端退出后自动恢复 WiFi。桌面端仍会在后台探测串口，重新连接后再次切回 USB。
+动画上传/读取和股票中文名称图片仍使用 HTTP，属于后续二进制串口协议的范围。
 
 ## 5. 网速曲线页（Mac + 设备同步显示）
 
@@ -249,27 +262,7 @@ Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge
 资源包同步进这个 .app**（`cp .build/debug/AIClockBridge .build/AIClockBridge.app/Contents/MacOS/`），
 否则 LaunchAgent 会不断复活旧版本、和手动启动的新版本抢 8765 端口轮流应答。
 
-## 6. 音乐播放页（Mac + 设备同步显示，自动切换）
-
-**AUTO 模式下自动切换**：Mac 一有音频在播放（放歌、看视频都算），设备自动切到音乐
-页；停止后自动切回桌宠/额度页。机制：`/status` 带 `music_playing` 字段（状态轮询
-5 秒一次 → 开始播放约 5 秒内切入），音乐页显示时靠 `/music` 的 2 秒轮询快速检测停止
-（约 2 秒切回）。仅 AUTO 生效；手动固定某模式（含固定「音乐播放」）时不受影响。
-`/api/info` 里 `mode` 是配置的模式、`effective` 是当前实际渲染的模式，Mac 镜像按
-`effective` 跟随。
-
-
-显示模式切到「音乐播放」（弹窗底部分段控件 / 右键菜单 / `POST /api/display mode=music`）
-后，Mac app 通过系统 Now Playing 信息读取当前播放的歌曲、歌手、播放进度和专辑封面，
-桥接服务提供：
-
-- `GET /music`：歌曲、歌手、专辑、播放状态、进度、封面版本号
-- `GET /music/cover.raw`：128x128 RGB565 封面原始像素，设备逐行读取后直接绘制
-
-设备每 2 秒刷新一次音乐信息；封面只有在版本号变化时重新拉取。Mac 弹窗镜像同样显示
-音乐页，方便不用看设备也能确认布局。
-
-## 7. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
+## 6. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
 
 除了日志 mtime 轮询（保留为兜底），bridge 还接收两个 CLI 官方 hooks 的事件推送，
 状态切换从"最多迟滞 20 秒"变成"毫秒级"：

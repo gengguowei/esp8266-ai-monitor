@@ -2,7 +2,8 @@
 
 ## 股票页遗留项（主体已于 2026-07-13 实现）
 - 备用数据源故障切换：新浪 `hq.sinajs.cn`（需 Referer 头）作腾讯接口的 fallback，参考 [Ashare](https://github.com/mpquant/Ashare) 双核心设计
-- 有线（无 WiFi）模式下的中文名称条：名称位图走 HTTP，纯 USB 时只显示代码，需串口分帧方案
+- ~~有线模式下的中文名称条~~：0.5.2 已做，走 `#WANTNAMES` / `#NAMEROW`（每帧一个像素行 + base64），
+  同样的分帧办法可以复用到下面的音乐页和精灵图
 - 设备网页配置自选股（目前只有 Mac/Win 菜单）
 
 ## USB 有线直连（本轮做了 Mac + 固件，遗留项）

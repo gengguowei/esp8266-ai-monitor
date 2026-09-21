@@ -18,12 +18,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var modeItems: [String: NSMenuItem] = [:]
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
-         nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16) {
+         stockMonitor: StockMonitor, port: UInt16) {
         self.service = service
         self.usage = usage
         self.port = port
         self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
-                                                     nowPlaying: nowPlaying, stockMonitor: stockMonitor)
+                                                     stockMonitor: stockMonitor)
         super.init()
         buildMenu()
         if let button = statusItem.button {
@@ -81,7 +81,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
                               ("固定 Codex", "codex"), ("网速曲线", "net"),
-                              ("音乐播放", "music"), ("股票行情", "stock")] {
+                              ("股票行情", "stock")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
@@ -172,7 +172,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
                                info.codexCustomSprite ? "X:自定义" : "X:默认"]
                 let showing = info.mode == "net" ? "网速"
-                    : info.mode == "music" ? "音乐"
+                    : info.mode == "stock" ? "股票"
                     : (info.showing == "claude" ? "Claude" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"

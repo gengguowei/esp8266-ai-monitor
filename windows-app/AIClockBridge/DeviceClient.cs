@@ -15,9 +15,11 @@ class DeviceInfo
     public string Ip = "";
     public string Ssid = "";
     public string Bridge = "";
-    public string Mode = "auto";       // configured: auto | claude | codex | net | music
-    public string Effective = "auto";  // what's actually on screen (AUTO may promote to music)
+    public string Mode = "auto";       // configured: auto | claude | codex | net | stock
+    public string Effective = "auto";
     public string Showing = "";
+    public string Firmware = "";
+    public string Transport = "WiFi";
     public int LastUpdateS = -1;       // seconds since the device last got /status data, -1 = never
     public int SpriteRev;              // bumped by the device on animation change
     public int Brightness = 100;       // backlight 0-100 (0 = off)
@@ -41,6 +43,10 @@ static class DeviceClient
     // posts, 30s sprite pull, 60s GIF upload+on-device decode), so the client
     // itself must not impose a shorter global one
     static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
+    public static SerialLink Serial { get; set; }
+
+    public static bool UsbConnected => Serial?.IsLinked == true;
+    public static string UsbPort => Serial?.PortName ?? "";
 
     public static string Host
     {
@@ -75,6 +81,11 @@ static class DeviceClient
     /// GET /api/info
     public static async Task<DeviceInfo> FetchInfo()
     {
+        if (Serial?.TryGetInfo(out var serialInfo) == true)
+        {
+            serialInfo.Transport = $"USB · {Serial.PortName}";
+            return serialInfo;
+        }
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         string body;
         try
@@ -86,11 +97,20 @@ static class DeviceClient
         {
             throw new DeviceException($"无法连接设备：{e.Message}");
         }
+        if (!TryParseInfo(body, out var info))
+            throw new DeviceException("设备响应解析失败");
+        info.Transport = "WiFi";
+        return info;
+    }
+
+    internal static bool TryParseInfo(string body, out DeviceInfo info)
+    {
+        info = null;
         try
         {
             using var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
-            var info = new DeviceInfo
+            info = new DeviceInfo
             {
                 Ip = Str(root, "ip"),
                 Ssid = Str(root, "ssid"),
@@ -100,6 +120,7 @@ static class DeviceClient
                 SpriteRev = Int(root, "sprite_rev"),
                 Brightness = Int(root, "brightness", 100),
                 Showing = Str(root, "showing"),
+                Firmware = Str(root, "fw"),
             };
             info.Effective = Str(root, "effective", info.Mode);
             if (root.TryGetProperty("claude", out var claude))
@@ -114,30 +135,44 @@ static class DeviceClient
                 info.CodexW = Int(codex, "w", 120);
                 info.CodexH = Int(codex, "h", 120);
             }
-            return info;
+            return true;
         }
-        catch (Exception)
+        catch
         {
-            throw new DeviceException("设备响应解析失败");
+            info = null;
+            return false;
         }
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music
-    public static Task SetDisplayMode(string mode) =>
-        PostForm("api/display", new() { ["mode"] = mode });
+    /// Set display mode over USB when available, otherwise POST /api/display.
+    public static Task SetDisplayMode(string mode)
+    {
+        if (Serial?.TrySendCommand(new() { ["display"] = mode }) == true)
+            return Task.CompletedTask;
+        return PostForm("api/display", new() { ["mode"] = mode });
+    }
 
     /// POST /api/bridge  host=ip:port
     public static Task SetBridgeHost(string bridgeHost) =>
         PostForm("api/bridge", new() { ["host"] = bridgeHost });
 
     /// POST /api/brightness  level=0-100 (0 = backlight off); device persists it
-    public static Task SetBrightness(int level) =>
-        PostForm("api/brightness", new() { ["level"] = level.ToString() });
+    public static Task SetBrightness(int level)
+    {
+        level = Math.Clamp(level, 0, 100);
+        if (Serial?.TrySendCommand(new() { ["brightness"] = level }) == true)
+            return Task.CompletedTask;
+        return PostForm("api/brightness", new() { ["level"] = level.ToString() });
+    }
 
     /// POST /api/screen  on=0|1. This is transient and deliberately separate
     /// from brightness, so locking Windows never overwrites the user's level.
-    public static Task SetScreenPower(bool on) =>
-        PostForm("api/screen", new() { ["on"] = on ? "1" : "0" });
+    public static Task SetScreenPower(bool on)
+    {
+        if (Serial?.TrySendCommand(new() { ["screen_on"] = on }) == true)
+            return Task.CompletedTask;
+        return PostForm("api/screen", new() { ["on"] = on ? "1" : "0" });
+    }
 
     /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
     /// and rescales the GIF on-board, then swaps the animation immediately.
@@ -307,7 +342,7 @@ static class DeviceClient
 
     // MARK: - pairing watchdog
 
-    /// Stamped on every device poll of our /status|/net|/music (see Program.cs).
+    /// Stamped by every device HTTP poll or valid USB handshake.
     public static DateTime DevicePollAt = DateTime.MinValue;
 
     static bool _healInFlight;
@@ -322,6 +357,7 @@ static class DeviceClient
     /// rate-limited to once per 5 minutes.
     public static async Task HealPairingIfNeeded(int port)
     {
+        if (UsbConnected) return;
         if (DateTime.UtcNow - DevicePollAt < TimeSpan.FromMinutes(3)) return; // device is polling us
         if (_healInFlight || DateTime.UtcNow - _lastHealAttempt < TimeSpan.FromMinutes(5)) return;
         _healInFlight = true;

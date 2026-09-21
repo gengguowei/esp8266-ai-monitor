@@ -1,0 +1,17 @@
+stub_flasher_8266.json
+======================
+
+Espressif's ESP8266 flasher stub, copied verbatim from esptool-js
+(https://github.com/espressif/esptool-js), file
+  lib/targets/stub_flasher/stub_flasher_8266.json
+which that project distributes under the Apache License 2.0.
+
+  Copyright Espressif Systems (Shanghai) CO LTD and contributors.
+  Licensed under the Apache License, Version 2.0.
+  http://www.apache.org/licenses/LICENSE-2.0
+
+The blob is byte-for-byte the same image esptool.py uploads. It is required
+rather than optional here: the ESP8266 ROM bootloader has no flash *read*
+command (ESP_READ_FLASH_SLOW exists only on ESP32), so backing the device up
+before overwriting it is impossible without running this stub. It also raises
+the flash write block from 1 KB to 16 KB.

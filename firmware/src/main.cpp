@@ -70,16 +70,11 @@ enum ActiveApp { APP_CLAUDE, APP_CODEX };
 ActiveApp currentApp = APP_CLAUDE;
 unsigned long lastSwitchMs = 0;
 
-// Display override, settable from the Mac app via POST /api/display:
+// Display override, settable from the desktop app via POST /api/display or USB:
 // auto = follow working status, claude/codex = pin that app on screen,
-// net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK };
+// net/stock = show PC-side telemetry pages instead of the pet.
+enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_STOCK };
 DisplayMode displayMode = MODE_AUTO;
-
-// When AUTO and the Mac reports audio playing, the screen auto-switches to the
-// music page and back when it stops — same spirit as the Claude/Codex auto
-// switch. Only AUTO does this; a pinned mode is always honored as-is.
-bool statusMusicPlaying = false;
 DisplayMode lastEffectiveMode = MODE_AUTO;
 
 // ---------- net speed mode state ----------
@@ -109,15 +104,6 @@ long netHistRx[NET_CHART_W], netHistTx[NET_CHART_W]; // one 250ms sample per col
 long netScale = 10240;    // current "nice" full-scale value (whole chart shares it)
 String netLastDl, netLastUl, netLastScaleText; // change detection for partial redraws
 
-// ---------- music mode state ----------
-const int MUSIC_COVER_W = 128;
-const int MUSIC_COVER_H = 128;
-// Title/artist come as a Mac-rendered bitmap strip (232x44) because the
-// panel fonts are ASCII-only and CJK titles would render as blanks.
-const int MUSIC_TEXT_W = 232;
-const int MUSIC_TEXT_H = 44;
-const int MUSIC_TEXT_X = 4, MUSIC_TEXT_Y = 150;
-const unsigned long MUSIC_POLL_INTERVAL_MS = 2000;
 // ---------- stock watchlist mode state ----------
 // Rows come pre-formatted from the bridge (GET /stock or serial #STOCK):
 // ASCII code + price/pct strings + up flag, so the firmware just paints.
@@ -141,14 +127,21 @@ const int STOCK_NAME_W = 156, STOCK_NAME_H = 16;
 int stockNamesRev = -1;
 int stockNamesDrawnRev = -1;
 
-String musicTitle, musicArtist, musicAlbum;
-bool musicPlaying = false;
-int musicElapsed = 0, musicDuration = 0;
-int musicArtworkRev = -1;
-int musicTextRev = -1;
-bool musicHasArtwork = false;
-bool musicChromeDrawn = false;
-unsigned long lastMusicPollMs = 0;
+// The HTTP route above needs WiFi. A USB-only clock therefore showed stock
+// codes with the names permanently missing, so the bridge can also push the
+// same strips down the serial line, one PIXEL ROW per frame:
+//   device -> bridge:  #WANTNAMES <rev>
+//   bridge -> device:  #NAMES <rev> <count>, then #NAMEROW <rev> <strip> <row> <base64>
+// A row is 156*2 = 312 bytes (416 base64 chars), so it fits serialLine[] and
+// decodes into the same rowBuf drawStockNames() already blits from - no 15KB
+// buffer, which this chip could not spare anyway.
+uint16_t nameRowsSeen[MAX_STOCKS]; // bit r set once row r of that strip landed
+int nameXferRev = -1;
+int nameXferCount = 0;
+unsigned long lastNamesRequestMs = 0;
+
+bool wiredActive();                   // defined with the wired-link section
+void requestNamesOverSerial(int rev); // ditto
 
 int claudeFrame = 0;
 int codexFrame = 0;
@@ -1154,164 +1147,6 @@ void pollNet() {
   http.end();
 }
 
-String timeText(int sec) {
-  if (sec < 0) sec = 0;
-  char buf[12];
-  snprintf(buf, sizeof(buf), "%d:%02d", sec / 60, sec % 60);
-  return String(buf);
-}
-
-void drawMusicCoverPlaceholder() {
-  const int x = (SCREEN_W - MUSIC_COVER_W) / 2;
-  const int y = 14;
-  tft.fillRect(x, y, MUSIC_COVER_W, MUSIC_COVER_H, TFT_DARKGREY);
-  tft.drawRect(x, y, MUSIC_COVER_W, MUSIC_COVER_H, TFT_DARKGREY);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_DARKGREY);
-  tft.drawString("No Art", SCREEN_CX, y + MUSIC_COVER_H / 2, 2);
-}
-
-bool drawMusicCoverFromBridge() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0 || !musicHasArtwork) return false;
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + bridgeHost + "/music/cover.raw";
-  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return false;
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-  WiFiClient *stream = http.getStreamPtr();
-  const int x = (SCREEN_W - MUSIC_COVER_W) / 2;
-  const int y = 14;
-  const size_t rowBytes = (size_t)MUSIC_COVER_W * 2;
-  bool ok = true;
-  for (int r = 0; r < MUSIC_COVER_H; r++) {
-    int got = stream->readBytes((uint8_t *)rowBuf, rowBytes);
-    if (got != (int)rowBytes) {
-      ok = false;
-      break;
-    }
-    tft.pushImage(x, y + r, MUSIC_COVER_W, 1, rowBuf);
-    yield();
-  }
-  http.end();
-  return ok;
-}
-
-// Streams the Mac-rendered 232x44 title/artist strip and blits it row by
-// row — the only way to get CJK on screen without shipping a font.
-bool drawMusicTextFromBridge() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + bridgeHost + "/music/text.raw";
-  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return false;
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-  WiFiClient *stream = http.getStreamPtr();
-  const size_t rowBytes = (size_t)MUSIC_TEXT_W * 2;
-  bool ok = true;
-  for (int r = 0; r < MUSIC_TEXT_H; r++) {
-    int got = stream->readBytes((uint8_t *)rowBuf, rowBytes);
-    if (got != (int)rowBytes) {
-      ok = false;
-      break;
-    }
-    tft.pushImage(MUSIC_TEXT_X, MUSIC_TEXT_Y + r, MUSIC_TEXT_W, 1, rowBuf);
-    yield();
-  }
-  http.end();
-  return ok;
-}
-
-// ASCII-only fallback if the strip fetch fails (CJK will stay blank, but at
-// least latin titles show something).
-String fitText(String s, int maxPx, int font) {
-  if (tft.textWidth(s, font) <= maxPx) return s;
-  while (s.length() > 0 && tft.textWidth(s + "...", font) > maxPx) {
-    s.remove(s.length() - 1);
-  }
-  return s + "...";
-}
-
-void drawMusicTextFallback() {
-  tft.fillRect(MUSIC_TEXT_X, MUSIC_TEXT_Y, MUSIC_TEXT_W, MUSIC_TEXT_H, TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  String title = musicTitle.length() ? musicTitle : "No Music";
-  tft.drawString(fitText(title, 216, 2), SCREEN_CX, MUSIC_TEXT_Y + 4, 2);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString(fitText(musicArtist, 216, 2), SCREEN_CX, MUSIC_TEXT_Y + 24, 2);
-}
-
-// Regions repaint independently: cover / text strip only when their rev
-// changes, progress bar + time on every poll (partial fill, no flicker
-// elsewhere).
-void drawMusicScreen(bool coverChanged, bool textChanged) {
-  if (!musicChromeDrawn) {
-    tft.fillScreen(TFT_BLACK);
-    coverChanged = true;
-    textChanged = true;
-    musicChromeDrawn = true;
-  }
-  if (coverChanged) {
-    if (!drawMusicCoverFromBridge()) drawMusicCoverPlaceholder();
-  }
-  if (textChanged) {
-    if (!drawMusicTextFromBridge()) drawMusicTextFallback();
-  }
-
-  const int bx = 20, by = 204, bw = 200, bh = 8;
-  tft.fillRect(0, by - 2, SCREEN_W, SCREEN_H - by + 2, TFT_BLACK);
-  tft.fillRect(bx, by, bw, bh, TFT_DARKGREY);
-  float progress = musicDuration > 0 ? (float)musicElapsed / (float)musicDuration : 0;
-  if (progress < 0) progress = 0;
-  if (progress > 1) progress = 1;
-  uint16_t color = musicPlaying ? TFT_GREEN : TFT_LIGHTGREY;
-  tft.fillRect(bx, by, (int)(bw * progress), bh, color);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString(timeText(musicElapsed) + " / " + timeText(musicDuration), SCREEN_CX, 220, 1);
-}
-
-void pollMusic() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + bridgeHost + "/music";
-  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
-  int code = http.GET();
-  if (code == HTTP_CODE_OK) {
-    JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      musicTitle = doc["title"] | "";
-      musicArtist = doc["artist"] | "";
-      musicAlbum = doc["album"] | "";
-      musicPlaying = doc["playing"] | false;
-      statusMusicPlaying = musicPlaying; // fast stop-detection while music shows
-      musicElapsed = doc["elapsed"] | 0;
-      musicDuration = doc["duration"] | 0;
-      musicHasArtwork = doc["has_artwork"] | false;
-      int rev = doc["artwork_rev"] | -1;
-      bool coverChanged = rev != musicArtworkRev;
-      musicArtworkRev = rev;
-      int tRev = doc["text_rev"] | -1;
-      bool textChanged = tRev != musicTextRev;
-      musicTextRev = tRev;
-      drawMusicScreen(coverChanged, textChanged);
-    }
-  }
-  http.end();
-}
-
 // ---------- stock watchlist screen ----------
 
 bool handleStockPayload(const String &payload) {
@@ -1449,7 +1284,10 @@ void drawStockScreen() {
 
   // CJK name strips, re-fetched when the watchlist (names_rev) changes
   if (stockNamesRev >= 0 && stockNamesDrawnRev != stockNamesRev) {
+    // HTTP first (one shot, ~15KB); the serial route is the fallback for a
+    // device with no WiFi - or one whose bridge is unreachable over the LAN.
     if (drawStockNames()) stockNamesDrawnRev = stockNamesRev;
+    else requestNamesOverSerial(stockNamesRev);
   }
 }
 
@@ -1528,20 +1366,10 @@ bool parseStatusJson(const String &payload) {
     codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
     codexStatus.needsInput = x["needs_input"] | false;
   }
-  statusMusicPlaying = doc["music_playing"] | false;
   return true;
 }
 
-// The mode actually rendered. In AUTO: a pending approval prompt wins (stay on
-// the pet so its border can flash red at you), otherwise audio promotes to the
-// music page.
 DisplayMode effectiveMode() {
-  if (displayMode == MODE_AUTO) {
-    if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
-    // music page needs HTTP for cover/text bitmaps, so don't auto-promote
-    // when running wired-only (no WiFi)
-    if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
-  }
   return displayMode;
 }
 
@@ -1579,7 +1407,7 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+  if (eff != MODE_NET && eff != MODE_STOCK) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
     if (updateActiveApp()) drawActiveApp();
@@ -1593,7 +1421,8 @@ void pollBridge() {
 // plugged into the computer over USB, the bridge pushes the same /status and
 // /net payloads down the CH340 serial line as newline-terminated frames:
 //   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
-//   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
+//                      #NAMES <rev> <count>   #NAMEROW <rev> <strip> <row> <b64>
+//   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}   #WANTNAMES <rev>
 // Everything else the device prints (logs) is ignored by the bridge.
 unsigned long lastSerialFrameMs = 0;
 bool wiredEverLinked = false;
@@ -1601,6 +1430,34 @@ char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
 size_t serialLineLen = 0;
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
+
+const char *displayModeName(DisplayMode m);
+
+void fillDeviceInfo(JsonDocument &doc) {
+  doc["name"] = "aiclock";
+  doc["ip"] = WiFi.localIP().toString();
+  doc["ssid"] = WiFi.SSID();
+  doc["bridge"] = bridgeHost;
+  doc["mode"] = displayModeName(displayMode);
+  doc["effective"] = displayModeName(effectiveMode());
+  doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : "codex";
+  doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
+  doc["sprite_rev"] = spriteRev;
+  doc["brightness"] = brightness;
+  doc["screen_on"] = screenPowerOn;
+  doc["wired"] = wiredActive();
+  doc["fw"] = FW_VERSION;
+  JsonObject c = doc["claude"].to<JsonObject>();
+  c["status"] = claudeStatus.status;
+  c["custom_sprite"] = claudeCustom;
+  c["w"] = CLAUDE_SPRITE_W;
+  c["h"] = CLAUDE_SPRITE_H;
+  JsonObject x = doc["codex"].to<JsonObject>();
+  x["status"] = codexStatus.status;
+  x["custom_sprite"] = codexCustom;
+  x["w"] = CODEX_SPRITE_W;
+  x["h"] = CODEX_SPRITE_H;
+}
 
 // First data over either transport replaces the boot/portal screen.
 void showMainUiIfNeeded() {
@@ -1611,11 +1468,88 @@ void showMainUiIfNeeded() {
   drawActiveApp();
 }
 
+// Minimal base64 decoder. Returns bytes written, or 0 if the input is
+// malformed or would overrun - a partially decoded row would paint garbage
+// pixels, so callers treat 0 as "drop this frame".
+size_t base64Decode(const char *src, uint8_t *out, size_t outMax) {
+  uint32_t acc = 0;
+  int bits = 0;
+  size_t n = 0;
+  for (const char *p = src; *p && *p != '\r' && *p != '\n'; p++) {
+    if (*p == '=' || *p == ' ') break;
+    int v;
+    if (*p >= 'A' && *p <= 'Z') v = *p - 'A';
+    else if (*p >= 'a' && *p <= 'z') v = *p - 'a' + 26;
+    else if (*p >= '0' && *p <= '9') v = *p - '0' + 52;
+    else if (*p == '+') v = 62;
+    else if (*p == '/') v = 63;
+    else return 0;
+    acc = (acc << 6) | (uint32_t)v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (n >= outMax) return 0;
+      out[n++] = (uint8_t)((acc >> bits) & 0xFF);
+    }
+  }
+  return n;
+}
+
+// Rate-limited: drawStockScreen() runs on every repaint, and the transfer takes
+// a few seconds, so without this the device would spam requests the whole time.
+void requestNamesOverSerial(int rev) {
+  if (!wiredActive()) return;
+  unsigned long now = millis();
+  if (lastNamesRequestMs != 0 && now - lastNamesRequestMs < 3000UL) return;
+  lastNamesRequestMs = now;
+  Serial.printf("#WANTNAMES %d\n", rev);
+}
+
+void handleNamesHeader(const char *args) {
+  int rev = -1, count = 0;
+  if (sscanf(args, "%d %d", &rev, &count) != 2) return;
+  if (count < 0) return;
+  nameXferRev = rev;
+  nameXferCount = count;
+  for (int i = 0; i < MAX_STOCKS; i++) nameRowsSeen[i] = 0;
+}
+
+void handleNameRow(const char *args) {
+  // Only accept rows while the stock page is actually on screen: these are
+  // blitted straight to the panel, so drawing them over another page would
+  // corrupt it - and the request is re-sent when the page comes back.
+  if (effectiveMode() != MODE_STOCK) return;
+
+  int rev = -1, strip = -1, row = -1, consumed = 0;
+  if (sscanf(args, "%d %d %d %n", &rev, &strip, &row, &consumed) < 3) return;
+  if (consumed <= 0) return;
+  if (rev != nameXferRev) return;                       // stale or no header yet
+  if (strip < 0 || strip >= MAX_STOCKS) return;
+  if (row < 0 || row >= STOCK_NAME_H) return;
+
+  const size_t rowBytes = (size_t)STOCK_NAME_W * 2;
+  if (base64Decode(args + consumed, (uint8_t *)rowBuf, sizeof(rowBuf)) != rowBytes) return;
+
+  if (strip < stockCount) tft.pushImage(70, 10 + strip * 54 + row, STOCK_NAME_W, 1, rowBuf);
+  nameRowsSeen[strip] |= (uint16_t)(1u << row);
+
+  const uint16_t full =
+      (STOCK_NAME_H >= 16) ? 0xFFFF : (uint16_t)((1u << STOCK_NAME_H) - 1);
+  int expect = nameXferCount < MAX_STOCKS ? nameXferCount : MAX_STOCKS;
+  for (int i = 0; i < expect; i++)
+    if (nameRowsSeen[i] != full) return;
+  stockNamesDrawnRev = nameXferRev;   // whole set landed
+}
+
 void handleSerialFrame(char *line) {
   lastSerialFrameMs = millis();
   wiredEverLinked = true;
   if (!strncmp(line, "#HELLO", 6)) {
-    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\"}\n", FW_VERSION);
+    JsonDocument doc;
+    fillDeviceInfo(doc);
+    Serial.print("#DEVICE ");
+    serializeJson(doc, Serial);
+    Serial.println();
     return;
   }
   if (!strncmp(line, "#STATUS ", 8)) {
@@ -1624,7 +1558,7 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+      if (eff != MODE_NET && eff != MODE_STOCK) {
         if (updateActiveApp()) drawActiveApp();
         else refreshActiveApp();
       }
@@ -1639,6 +1573,14 @@ void handleSerialFrame(char *line) {
     handleStockPayload(String(line + 7));
     return;
   }
+  if (!strncmp(line, "#NAMES ", 7)) {
+    handleNamesHeader(line + 7);
+    return;
+  }
+  if (!strncmp(line, "#NAMEROW ", 9)) {
+    handleNameRow(line + 9);
+    return;
+  }
   if (!strncmp(line, "#CMD ", 5)) {
     JsonDocument doc;
     if (deserializeJson(doc, line + 5)) return;
@@ -1647,6 +1589,9 @@ void handleSerialFrame(char *line) {
       applyBrightness();
       saveBrightness();
     }
+    if (doc["screen_on"].is<bool>()) {
+      setScreenPower(doc["screen_on"].as<bool>());
+    }
     const char *mode = doc["display"] | (const char *)nullptr;
     if (mode) {
       String m(mode);
@@ -1654,7 +1599,6 @@ void handleSerialFrame(char *line) {
       else if (m == "claude") displayMode = MODE_CLAUDE;
       else if (m == "codex") displayMode = MODE_CODEX;
       else if (m == "net") displayMode = MODE_NET;
-      else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
@@ -1777,36 +1721,13 @@ const char *displayModeName(DisplayMode m) {
   if (m == MODE_CLAUDE) return "claude";
   if (m == MODE_CODEX) return "codex";
   if (m == MODE_NET) return "net";
-  if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
   return "auto";
 }
 
 void handleApiInfo() {
   JsonDocument doc;
-  doc["ip"] = WiFi.localIP().toString();
-  doc["ssid"] = WiFi.SSID();
-  doc["bridge"] = bridgeHost;
-  doc["mode"] = displayModeName(displayMode);           // configured mode
-  doc["effective"] = displayModeName(effectiveMode());   // what's on screen now
-  doc["music_playing"] = statusMusicPlaying;
-  doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : "codex";
-  doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
-  doc["sprite_rev"] = spriteRev;
-  doc["brightness"] = brightness;
-  doc["screen_on"] = screenPowerOn;
-  doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
-  doc["fw"] = FW_VERSION;
-  JsonObject c = doc["claude"].to<JsonObject>();
-  c["status"] = claudeStatus.status;
-  c["custom_sprite"] = claudeCustom;
-  c["w"] = CLAUDE_SPRITE_W;
-  c["h"] = CLAUDE_SPRITE_H;
-  JsonObject x = doc["codex"].to<JsonObject>();
-  x["status"] = codexStatus.status;
-  x["custom_sprite"] = codexCustom;
-  x["w"] = CODEX_SPRITE_W;
-  x["h"] = CODEX_SPRITE_H;
+  fillDeviceInfo(doc);
   String out;
   serializeJson(doc, out);
   webServer.send(200, "application/json", out);
@@ -1818,19 +1739,15 @@ void handleApiDisplay() {
   else if (mode == "claude") displayMode = MODE_CLAUDE;
   else if (mode == "codex") displayMode = MODE_CODEX;
   else if (mode == "net") displayMode = MODE_NET;
-  else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|stock");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
   if (displayMode == MODE_NET) {
     netChromeDrawn = false;
     lastNetPollMs = 0; // poll + draw on the next loop tick
-  } else if (displayMode == MODE_MUSIC) {
-    musicChromeDrawn = false;
-    lastMusicPollMs = 0; // poll + draw on the next loop tick
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
@@ -2243,18 +2160,14 @@ void loop() {
 
   unsigned long nowMs = millis();
 
-  // Effective mode may differ from the configured one (AUTO -> music while
-  // audio plays). On a transition, reset the incoming mode's chrome so it
-  // repaints cleanly, and repaint the pet immediately when returning to it.
+  // On a transition, reset the incoming mode's chrome so it repaints cleanly,
+  // and repaint the pet immediately when returning to it.
   DisplayMode eff = effectiveMode();
   if (eff != lastEffectiveMode) {
     lastEffectiveMode = eff;
     if (eff == MODE_NET) {
       netChromeDrawn = false;
       lastNetPollMs = 0;
-    } else if (eff == MODE_MUSIC) {
-      musicChromeDrawn = false;
-      lastMusicPollMs = 0;
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
@@ -2273,13 +2186,7 @@ void loop() {
     }
     if (nowMs - lastNetPollMs >= NET_POLL_INTERVAL_MS) {
       lastNetPollMs = nowMs;
-      pollNet();
-    }
-  } else if (eff == MODE_MUSIC) {
-    // music now-playing mode: cover art + track metadata from the bridge
-    if (nowMs - lastMusicPollMs >= MUSIC_POLL_INTERVAL_MS) {
-      lastMusicPollMs = nowMs;
-      pollMusic();
+      if (!wiredActive()) pollNet();
     }
   } else if (eff == MODE_STOCK) {
     // stock watchlist: HTTP poll unless the serial link is pushing #STOCK

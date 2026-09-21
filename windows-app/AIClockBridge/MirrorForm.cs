@@ -43,14 +43,6 @@ sealed class MirrorControl : Control
     public bool StockMode;
     public StockMonitor.Row[] StockRows = Array.Empty<StockMonitor.Row>();
 
-    public bool MusicMode;
-    public string MusicTitle = "";
-    public string MusicArtist = "";
-    public double MusicElapsed;
-    public double MusicDuration;
-    public bool MusicPlaying;
-    public Bitmap MusicCover;
-
     static readonly Image ClaudeLogo = LoadAsset("claude-logo.png");
     static readonly Image CodexLogo = LoadAsset("codex-logo.png");
 
@@ -110,11 +102,6 @@ sealed class MirrorControl : Control
         if (NetMode)
         {
             DrawNetScene(g);
-            return;
-        }
-        if (MusicMode)
-        {
-            DrawMusicScene(g);
             return;
         }
         if (StockMode)
@@ -182,51 +169,6 @@ sealed class MirrorControl : Control
             g.FillRectangle(red, m, m, t, side);
             g.FillRectangle(red, 240 - m - t, m, t, side);
         }
-    }
-
-    void DrawMusicScene(Graphics g)
-    {
-        var coverRect = new Rectangle(56, 16, 128, 128);
-        if (MusicCover != null)
-        {
-            var state = g.Save();
-            g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.DrawImage(MusicCover, coverRect);
-            g.Restore(state);
-        }
-        else
-        {
-            using var dark = new SolidBrush(Color.FromArgb(64, 64, 64));
-            g.FillRectangle(dark, coverRect);
-            using var font = new Font("Consolas", 13, FontStyle.Bold, GraphicsUnit.Pixel);
-            using var fmt = new StringFormat { Alignment = StringAlignment.Center };
-            g.DrawString("No Art", font, Brushes.LightGray, new RectangleF(56, 72, 128, 20), fmt);
-        }
-
-        using var titleFmt = new StringFormat
-        {
-            Alignment = StringAlignment.Center,
-            Trimming = StringTrimming.EllipsisCharacter,
-            FormatFlags = StringFormatFlags.NoWrap,
-        };
-        var title = MusicTitle.Length == 0 ? "No Music" : MusicTitle;
-        using (var font = new Font("Microsoft YaHei UI", 15, FontStyle.Bold, GraphicsUnit.Pixel))
-        {
-            g.DrawString(title, font, Brushes.White, new RectangleF(12, 154, 216, 24), titleFmt);
-        }
-        using (var font = new Font("Microsoft YaHei UI", 12, FontStyle.Regular, GraphicsUnit.Pixel))
-        {
-            g.DrawString(MusicArtist, font, Brushes.LightGray,
-                         new RectangleF(12, 178, 216, 20), titleFmt);
-        }
-
-        var bar = new RectangleF(20, 210, 200, 8);
-        using var barBg = new SolidBrush(Color.FromArgb(64, 64, 64));
-        g.FillRectangle(barBg, bar);
-        var frac = MusicDuration > 0 ? (float)Math.Clamp(MusicElapsed / MusicDuration, 0, 1) : 0;
-        using var barFill = new SolidBrush(MusicPlaying ? Green : Color.Gray);
-        g.FillRectangle(barFill, bar.X, bar.Y, bar.Width * frac, bar.Height);
     }
 
     /// Replica of the firmware's net-speed screen v2: header readouts, then
@@ -384,12 +326,11 @@ sealed class MirrorForm : Form
 {
     readonly StatusService _service;
     readonly NetSpeedMonitor _netMonitor;
-    readonly NowPlayingMonitor _nowPlaying;
     readonly StockMonitor _stockMonitor;
     readonly MirrorControl _mirror = new();
     readonly RadioButton[] _modeButtons;
-    static readonly string[] Modes = { "auto", "claude", "codex", "net", "music", "stock" };
-    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "音乐", "股票" };
+    static readonly string[] Modes = { "auto", "claude", "codex", "net", "stock" };
+    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "股票" };
     readonly Label _statusLabel = new();
     readonly TrackBar _brightness = new() { Minimum = 0, Maximum = 100, TickStyle = TickStyle.None };
     readonly Label _brightnessValue = new();
@@ -410,12 +351,10 @@ sealed class MirrorForm : Form
     string _fetchingSlot;
     bool _applyingMode; // suppress CheckedChanged while reflecting device state
 
-    public MirrorForm(StatusService service, NetSpeedMonitor netMonitor, NowPlayingMonitor nowPlaying,
-                      StockMonitor stockMonitor)
+    public MirrorForm(StatusService service, NetSpeedMonitor netMonitor, StockMonitor stockMonitor)
     {
         _service = service;
         _netMonitor = netMonitor;
-        _nowPlaying = nowPlaying;
         _stockMonitor = stockMonitor;
 
         FormBorderStyle = FormBorderStyle.None;
@@ -599,19 +538,15 @@ sealed class MirrorForm : Form
         _modeButtons[modeIdx].Checked = true;
         _applyingMode = false;
         var modeText = info.Mode == "auto" ? "自动切换"
-            : info.Mode == "net" ? "网速曲线"
-            : info.Mode == "music" ? "音乐播放" : "固定显示";
-        _statusLabel.Text = $"{info.Ip} · {modeText} · 数据 {info.Bridge}";
+            : info.Mode == "net" ? "网速曲线" : "固定显示";
+        _statusLabel.Text = $"{info.Transport} · {modeText}";
     }
 
     /// Quota lines & ring exactly as the firmware computes them from /status.
     void ApplyScene(DeviceInfo info)
     {
-        // mirror what's actually on the device screen (effective), so an
-        // AUTO device that auto-switched to music shows music here too
         var enteringNet = info.Effective == "net" && !_mirror.NetMode;
         _mirror.NetMode = info.Effective == "net";
-        _mirror.MusicMode = info.Effective == "music";
         _mirror.StockMode = info.Effective == "stock";
         if (_mirror.StockMode)
         {
@@ -622,20 +557,6 @@ sealed class MirrorForm : Form
         if (_mirror.NetMode)
         {
             if (enteringNet) _mirror.ResetNetSweep(); // fresh sweep, like the device
-            _mirror.Invalidate();
-            return;
-        }
-        if (_mirror.MusicMode)
-        {
-            var s = _nowPlaying.Snapshot;
-            _mirror.MusicTitle = s.Title;
-            _mirror.MusicArtist = s.Artist;
-            _mirror.MusicElapsed = s.Elapsed;
-            _mirror.MusicDuration = s.Duration;
-            _mirror.MusicPlaying = s.Playing;
-            _mirror.MusicCover?.Dispose();
-            var cover = _nowPlaying.CoverRgb565;
-            _mirror.MusicCover = cover.Length > 0 ? Rgb565.Decode(cover, 0, 128, 128) : null;
             _mirror.Invalidate();
             return;
         }

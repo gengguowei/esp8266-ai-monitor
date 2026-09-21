@@ -49,7 +49,7 @@ final class StockMonitor {
     private var timer: Timer?
 
     // The device's font is ASCII-only, so CJK company names go down as Mac-
-    // rendered RGB565 strips (same trick as the music title strip): one
+    // rendered RGB565 strips: one
     // NAME_W x NAME_H strip per row, wire format [1 byte count][strips...].
     // names_rev in /stock tells the device when to re-fetch.
     static let nameW = 156, nameH = 16

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
 
 namespace AIClockBridge;
@@ -13,6 +13,7 @@ sealed class TrayAppContext : ApplicationContext
     readonly StatusService _service;
     readonly UsageFetcher _usage;
     readonly WindowsScreenPowerController _screenPower;
+    readonly StockMonitor _stockMonitor;
     readonly int _port;
     readonly MirrorForm _mirror;
     readonly ContextMenuStrip _menu = new();
@@ -20,17 +21,30 @@ sealed class TrayAppContext : ApplicationContext
     readonly ToolStripMenuItem _claudeUsageItem = new("Claude …") { Enabled = false };
     readonly ToolStripMenuItem _codexUsageItem = new("Codex …") { Enabled = false };
     readonly ToolStripMenuItem _deviceInfoItem = new("设备：未设置") { Enabled = false };
+    /// The device reports its IP/SSID/bridge host in every #DEVICE reply, but
+    /// none of it was ever surfaced - so "the CJK stock names never appear" had
+    /// no visible cause, even though those strips are pulled over HTTP and need
+    /// exactly these two things to be right.
+    readonly ToolStripMenuItem _deviceNetItem = new("") { Enabled = false, Visible = false };
+    /// Only shown while quotes are failing; silence used to be indistinguishable
+    /// from a market that simply had not moved.
+    readonly ToolStripMenuItem _stockErrorItem = new("") { Enabled = false, Visible = false };
     readonly Dictionary<string, ToolStripMenuItem> _modeItems = new();
+    ToolStripMenuItem _autoStartItem;
+    /// Set while we write Checked ourselves, so the resync does not re-enter the
+    /// toggle handler and rewrite the registry on every menu open.
+    bool _syncingAutoStart;
 
     public TrayAppContext(StatusService service, UsageFetcher usage, NetSpeedMonitor netMonitor,
-                          NowPlayingMonitor nowPlaying, StockMonitor stockMonitor,
+                          StockMonitor stockMonitor,
                           WindowsScreenPowerController screenPower, int port)
     {
         _service = service;
         _usage = usage;
         _screenPower = screenPower;
+        _stockMonitor = stockMonitor;
         _port = port;
-        _mirror = new MirrorForm(service, netMonitor, nowPlaying, stockMonitor);
+        _mirror = new MirrorForm(service, netMonitor, stockMonitor);
 
         BuildMenu();
         _trayIcon = new NotifyIcon
@@ -46,8 +60,10 @@ sealed class TrayAppContext : ApplicationContext
         };
         _menu.Opening += (_, _) =>
         {
-            _usage.Refresh();
+            _usage.Refresh(userInitiated: true);
             RefreshUsageLines();
+            RefreshStockError();
+            SyncAutoStartItem();
             _ = RefreshDeviceSection();
         };
         _usage.OnUpdate = RefreshUsageLines;
@@ -71,9 +87,19 @@ sealed class TrayAppContext : ApplicationContext
     {
         _menu.Items.Add(_claudeUsageItem);
         _menu.Items.Add(_codexUsageItem);
+        _menu.Items.Add(MakeItem("启用 Claude 桌面状态同步", (_, _) =>
+        {
+            try
+            {
+                var path = ClaudeHooks.Install();
+                MessageBox.Show($"已配置状态 Hooks，请重新打开 Claude Code 本地会话。\n设置：{path}\n原有设置已保留；已有文件会生成备份。", "Claude 状态同步");
+            }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "配置失败"); }
+        }));
         _menu.Items.Add(new ToolStripSeparator());
 
         _menu.Items.Add(_deviceInfoItem);
+        _menu.Items.Add(_deviceNetItem);
         _menu.Items.Add(MakeItem("自动查找并配对设备", async (_, _) => await AutoPairAction()));
         _menu.Items.Add(MakeItem("设置设备地址…", (_, _) => SetDeviceAddress()));
         _menu.Items.Add(MakeItem("打开设备网页", (_, _) => OpenDevicePage()));
@@ -82,8 +108,7 @@ sealed class TrayAppContext : ApplicationContext
         foreach (var (title, mode) in new[]
         {
             ("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-            ("固定 Codex", "codex"), ("网速曲线", "net"), ("音乐播放", "music"),
-            ("股票行情", "stock"),
+            ("固定 Codex", "codex"), ("网速曲线", "net"), ("股票行情", "stock"),
         })
         {
             var item = new ToolStripMenuItem(title);
@@ -103,6 +128,15 @@ sealed class TrayAppContext : ApplicationContext
             _screenPower.Enabled = followLockItem.Checked;
         _menu.Items.Add(followLockItem);
 
+        _autoStartItem = new ToolStripMenuItem("开机自动启动")
+        {
+            CheckOnClick = true,
+            Checked = AutoStart.IsEnabled(),
+        };
+        _autoStartItem.CheckedChanged += (_, _) => ToggleAutoStart();
+        _menu.Items.Add(_autoStartItem);
+
+        _menu.Items.Add(_stockErrorItem);
         _menu.Items.Add(MakeItem("设置自选股…", (_, _) =>
         {
             var input = InputDialog.Show(
@@ -131,11 +165,24 @@ sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(MakeItem("刷新", (_, _) =>
         {
-            _usage.Refresh();
+            _usage.Refresh(userInitiated: true);
             RefreshUsageLines();
             _ = RefreshDeviceSection();
         }));
         _menu.Items.Add(MakeItem("桥接服务地址", (_, _) => ShowAddress()));
+        _menu.Items.Add(MakeItem("打开日志文件夹", (_, _) =>
+        {
+            try
+            {
+                Directory.CreateDirectory(Log.Folder);
+                Process.Start(new ProcessStartInfo(Log.Folder) { UseShellExecute = true });
+            }
+            catch (Exception e)
+            {
+                MessageBox.Show($"打不开日志文件夹：{e.Message}\n{Log.Folder}",
+                    "AI Clock Bridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }));
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(MakeItem("退出", (_, _) =>
         {
@@ -151,7 +198,101 @@ sealed class TrayAppContext : ApplicationContext
         return item;
     }
 
+    // MARK: - start at logon
+
+    void ToggleAutoStart()
+    {
+        if (_syncingAutoStart) return;
+        try
+        {
+            if (_autoStartItem.Checked)
+            {
+                AutoStart.Enable();
+                OfferToRemoveLegacyShortcuts();
+            }
+            else
+            {
+                AutoStart.Disable();
+            }
+        }
+        catch (Exception e)
+        {
+            MessageBox.Show(e.Message, "开机自动启动",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        SyncAutoStartItem();   // show what the registry actually says now
+    }
+
+    /// The user can also flip this in Task Manager's startup tab, so the tick is
+    /// re-read from the registry every time the menu opens rather than trusted
+    /// from the last click.
+    void SyncAutoStartItem()
+    {
+        if (_autoStartItem == null) return;
+        var enabled = AutoStart.IsEnabled();
+        if (_autoStartItem.Checked == enabled) return;
+        _syncingAutoStart = true;
+        _autoStartItem.Checked = enabled;
+        _syncingAutoStart = false;
+    }
+
+    /// Older READMEs told people to drop a shortcut into shell:startup by hand.
+    /// Left in place next to the Run entry it would start the bridge twice.
+    static void OfferToRemoveLegacyShortcuts()
+    {
+        var shortcuts = AutoStart.LegacyStartupShortcuts();
+        if (shortcuts.Length == 0) return;
+        var names = string.Join("\n", shortcuts.Select(System.IO.Path.GetFileName));
+        var answer = MessageBox.Show(
+            "启动文件夹里还有手动放进去的快捷方式，会让程序开机启动两次：\n\n" + names
+            + "\n\n要删掉这些快捷方式吗？（只删快捷方式，程序本体不动）",
+            "开机自动启动", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer != DialogResult.Yes) return;
+        foreach (var path in shortcuts)
+        {
+            try { System.IO.File.Delete(path); }
+            catch (Exception e)
+            {
+                MessageBox.Show($"删除失败：{System.IO.Path.GetFileName(path)}\n{e.Message}",
+                    "开机自动启动", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+    }
+
     // MARK: - refresh
+
+    /// The stock page's Chinese names are RGB565 strips the device pulls from
+    /// our /stock/names.raw over HTTP - prices arrive over the serial link and
+    /// are unaffected. So "prices move, names never show" means WiFi or the
+    /// bridge host is wrong on the device, and this line says which.
+    void ShowDeviceNetState(DeviceInfo info)
+    {
+        var wifi = info.Ssid.Length > 0 && info.Ip.Length > 0 && info.Ip != "0.0.0.0"
+            ? $"WiFi {info.Ssid} {info.Ip}"
+            : "未连 WiFi";
+        var bridge = info.Bridge.Length > 0 ? info.Bridge : "未设置";
+        var hint = "";
+        if (wifi == "未连 WiFi")
+            hint = "　← 股票中文名需要 WiFi";
+        else if (info.Bridge.Length == 0)
+            hint = "　← 点上面「把本机设为设备桥接」";
+        _deviceNetItem.Text = $"　{wifi} · 桥接 {bridge}{hint}";
+        _deviceNetItem.Visible = true;
+    }
+
+    void RefreshStockError()
+    {
+        var error = _stockMonitor?.Error;
+        if (string.IsNullOrEmpty(error))
+        {
+            _stockErrorItem.Visible = false;
+            return;
+        }
+        var at = _stockMonitor.FetchedAt;
+        var age = at.HasValue ? $"，最后成功 {at.Value.ToLocalTime():HH:mm}" : "";
+        _stockErrorItem.Text = $"股票：{error}{age}";
+        _stockErrorItem.Visible = true;
+    }
 
     void RefreshUsageLines()
     {
@@ -178,6 +319,18 @@ sealed class TrayAppContext : ApplicationContext
         }
         if (parts.Count == 0) return $"{name}：额度未知";
         var result = $"{name}　" + string.Join("　", parts);
+        // Claude has two possible sources with visibly different quality (the
+        // cache carries no reset countdown), so say which one produced this.
+        if (u.DesktopCache)
+        {
+            result += $"　（桌面缓存 · {u.FetchedAt?.ToLocalTime():MM-dd HH:mm}"
+                + (u.DesktopStale ? " · 已过期，请打开 Claude）" : "）");
+            // On a cache reading the error explains why the live source is
+            // unavailable - the whole reason this line is not "凭据实时".
+            return u.Error == null ? result : result + $"　（{u.Error}）";
+        }
+        if (name == "Claude" && u.FetchedAt.HasValue)
+            result += $"　（凭据实时 · {u.FetchedAt?.ToLocalTime():HH:mm}）";
         return u.Error == null ? result : result + $"　（缓存：{u.Error}）";
     }
 
@@ -191,13 +344,14 @@ sealed class TrayAppContext : ApplicationContext
     async Task RefreshDeviceSection()
     {
         var host = DeviceClient.Host;
-        if (host.Length == 0)
+        if (host.Length == 0 && !DeviceClient.UsbConnected)
         {
             _deviceInfoItem.Text = "设备：未设置地址";
             foreach (var item in _modeItems.Values) item.Checked = false;
             return;
         }
-        _deviceInfoItem.Text = $"设备：{host}（连接中…）";
+        var target = DeviceClient.UsbConnected ? $"USB · {DeviceClient.UsbPort}" : host;
+        _deviceInfoItem.Text = $"设备：{target}（连接中…）";
         DeviceInfo info;
         try
         {
@@ -205,7 +359,7 @@ sealed class TrayAppContext : ApplicationContext
         }
         catch (Exception)
         {
-            _deviceInfoItem.Text = $"设备：{host}（无法连接）";
+            _deviceInfoItem.Text = $"设备：{target}（无法连接）";
             foreach (var item in _modeItems.Values) item.Checked = false;
             // self-heal: the device may have moved to a new DHCP address;
             // if it recently polled us from a different IP, adopt that.
@@ -223,10 +377,11 @@ sealed class TrayAppContext : ApplicationContext
             info.CodexCustomSprite ? "X:自定义" : "X:默认",
         };
         var showing = info.Mode == "net" ? "网速"
-            : info.Mode == "music" ? "音乐"
+            : info.Mode == "stock" ? "股票"
             : (info.Showing == "claude" ? "Claude" : "Codex");
         _deviceInfoItem.Text =
-            $"设备：{info.Ip} · 正在显示 {showing} · {string.Join(" ", sprites)}";
+            $"设备：{info.Transport} · 正在显示 {showing} · {string.Join(" ", sprites)}";
+        ShowDeviceNetState(info);
         foreach (var (mode, item) in _modeItems) item.Checked = mode == info.Mode;
     }
 
