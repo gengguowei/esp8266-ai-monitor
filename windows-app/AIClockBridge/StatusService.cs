@@ -50,6 +50,10 @@ class StatusSnapshot
         {
             w.WriteStartObject();
             w.WriteNumber("ts", Ts);
+            // Whether the Beijing date of `ts` is an A-share trading day
+            // (weekends + exchange holidays). Firmware 0.4.20+ uses it for
+            // the auto stock page; older firmware ignores the field.
+            w.WriteBoolean("cn_trading_day", ChinaMarketCalendar.IsTradingDay(Ts));
             w.WriteBoolean("screen_on", ScreenOn);
             w.WriteStartObject("claude");
             w.WriteString("status", Claude.Status);
@@ -154,6 +158,8 @@ sealed class StatusService
     AgentEvent _claudeEvent;
     AgentEvent _codexEvent;
     readonly Dictionary<string, (AgentEvent Event, double? Attention)> _claudeSessions = new();
+    readonly Dictionary<string, AgentEvent> _claudeTranscriptEvents = new();
+    string _lastClaudeStatus;
     // "needs input": a permission/approval prompt is on screen, waiting on the
     // user. Set by an attention event, cleared by the next concrete lifecycle
     // event (the prompt got answered) or by TTL.
@@ -188,8 +194,10 @@ sealed class StatusService
         lock (_lock)
         {
             var now = Now();
+            if (agent == "claude" && ev == "Notification" && message == "idle_prompt") ev = "Stop";
             if (agent == "claude" && !string.IsNullOrWhiteSpace(sessionId))
             {
+                Log.Write($"[status] claude hook={ev}; tracked_sessions={_claudeSessions.Count}");
                 foreach (var key in _claudeSessions.Where(p => now - p.Value.Event.At > IdleThreshold)
                     .Select(p => p.Key).ToArray()) _claudeSessions.Remove(key);
                 if (ev == "SessionEnd") { _claudeSessions.Remove(sessionId); return; }
@@ -298,15 +306,33 @@ sealed class StatusService
             snap.Claude.Status = OverrideStatus(snap.Claude.Status, _claudeEvent, now);
             snap.Codex.Status = OverrideStatus(snap.Codex.Status, _codexEvent, now);
             snap.Claude.NeedsInput = NeedsInput(_claudeNeedsInputAt, now);
-            var sessions = _claudeSessions.Values.Where(s => now - s.Event.At < IdleThreshold).ToArray();
+            // A lost Stop must not keep a completed turn working for ten minutes.
+            // Reconcile only the SAME session, and only with a newer transcript event.
+            foreach (var id in _claudeSessions.Keys.ToArray())
+            {
+                var tracked = _claudeSessions[id];
+                if (_claudeTranscriptEvents.TryGetValue(id, out var transcript)
+                    && transcript.State == "idle" && transcript.At >= tracked.Event.At)
+                    _claudeSessions[id] = (transcript, null);
+            }
+            var sessions = _claudeSessions.Values.Concat(_claudeTranscriptEvents
+                .Where(p => !_claudeSessions.ContainsKey(p.Key))
+                .Select(p => (Event: p.Value, Attention: (double?)null)))
+                .Where(s => now - s.Event.At < IdleThreshold).ToArray();
             if (sessions.Length > 0)
             {
                 if (sessions.Any(s => s.Event.State == "working" && now - s.Event.At < WorkingEventTTL))
                     snap.Claude.Status = "working";
-                else if (snap.Claude.Status == "offline") snap.Claude.Status = "idle";
+                else snap.Claude.Status = "idle";
                 snap.Claude.NeedsInput |= sessions.Any(s => NeedsInput(s.Attention, now));
             }
             snap.Codex.NeedsInput = NeedsInput(_codexNeedsInputAt, now);
+            if (_lastClaudeStatus != snap.Claude.Status)
+            {
+                Log.Write($"[status] claude {_lastClaudeStatus ?? "unknown"}->{snap.Claude.Status};"
+                    + $" hook_sessions={_claudeSessions.Count}; transcript_sessions={_claudeTranscriptEvents.Count}");
+                _lastClaudeStatus = snap.Claude.Status;
+            }
             snap.ScreenOn = ScreenOnProvider?.Invoke() ?? true;
             return snap;
         }
@@ -387,6 +413,7 @@ sealed class StatusService
         var tokensToday = 0;
         double lastMtime = 0;
         double? firstActiveInWindow = null;
+        _claudeTranscriptEvents.Clear();
 
         if (Directory.Exists(_claudeDir))
         {
@@ -417,12 +444,12 @@ sealed class StatusService
                 if (lines == null) continue;
                 foreach (var line in lines)
                 {
-                    if (!line.Contains("\"usage\":{")) continue;
                     JsonDocument doc;
                     try { doc = JsonDocument.Parse(line); } catch { continue; }
                     using (doc)
                     {
                         var root = doc.RootElement;
+                        ReadClaudeTranscriptEvent(root, now);
                         if (!TryProp(root, "message", out var message)
                             || !TryProp(message, "usage", out var usage)) continue;
                         var entryEpoch = ParseIso(StringVal(root, "timestamp"));
@@ -443,7 +470,32 @@ sealed class StatusService
         var s = new ClaudeStatus { TokensToday = tokensToday };
         if (firstActiveInWindow.HasValue) s.SessionMin = (int)((now - firstActiveInWindow.Value) / 60);
         s.Status = StatusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9);
+        // Background metadata writes are not proof the agent is still working.
+        // Explicit conversation events take precedence over file modification time.
+        if (_claudeTranscriptEvents.Count > 0)
+            s.Status = _claudeTranscriptEvents.Values.Any(e => e.State == "working"
+                && now - e.At < WorkingEventTTL) ? "working"
+                : _claudeTranscriptEvents.Values.Any(e => now - e.At < IdleThreshold) ? "idle" : "offline";
         return s;
+    }
+
+    void ReadClaudeTranscriptEvent(JsonElement root, double now)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return;
+        if (TryProp(root, "isSidechain", out var side) && side.ValueKind == JsonValueKind.True) return;
+        var id = StringVal(root, "sessionId");
+        var at = ParseIso(StringVal(root, "timestamp"));
+        if (string.IsNullOrEmpty(id) || !at.HasValue || at > now + 5) return;
+        var type = StringVal(root, "type");
+        string state = null;
+        if (type == "user" || type == "api-request") state = "working";
+        if (type == "assistant" && TryProp(root, "message", out var message))
+        {
+            var reason = StringVal(message, "stop_reason");
+            state = reason == "end_turn" || reason == "stop_sequence" ? "idle" : "working";
+        }
+        if (state != null && (!_claudeTranscriptEvents.TryGetValue(id, out var previous) || at >= previous.At))
+            _claudeTranscriptEvents[id] = new AgentEvent(state, at.Value);
     }
 
     // MARK: - Codex

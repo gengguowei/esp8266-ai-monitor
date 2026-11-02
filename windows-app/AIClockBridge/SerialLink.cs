@@ -15,7 +15,6 @@ sealed class SerialLink : IDisposable
     static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(3);
     static readonly TimeSpan HelloInterval = TimeSpan.FromSeconds(3);
     static readonly TimeSpan StatusInterval = TimeSpan.FromSeconds(5);
-    static readonly TimeSpan NetInterval = TimeSpan.FromSeconds(2);
     static readonly TimeSpan LinkTimeout = TimeSpan.FromSeconds(12);
 
     // CJK stock names are RGB565 strips the device normally pulls over HTTP,
@@ -30,15 +29,17 @@ sealed class SerialLink : IDisposable
     // HTTP path already blits from, so the device needs no 15KB buffer.
     //
     // Paced, because the device's 2048-byte UART buffer is only drained once per
-    // loop() and a full set is ~21KB: two rows per 250ms tick is ~3.6 KB/s
-    // against a 11.5 KB/s line. A full set takes ~6s, and is only ever sent when
-    // the watchlist changes.
+    // loop(). Two rows per 150ms tick keep each burst below 1KB and transfer a
+    // three-stock name set in about 4s without flooding the receiver.
     const int NameRowsPerTick = 2;
     static readonly TimeSpan NameRequestDebounce = TimeSpan.FromSeconds(2);
 
     readonly StatusService _service;
-    readonly NetSpeedMonitor _netMonitor;
     readonly StockMonitor _stockMonitor;
+    readonly BilibiliMonitor _upMonitor;
+    List<byte[]> _upFrames;
+    int _upFramesSent;
+    DateTime _lastUpRequestAt = DateTime.MinValue;
     readonly object _ioLock = new();
     readonly object _stateLock = new();
     readonly List<byte> _rx = new();
@@ -53,17 +54,16 @@ sealed class SerialLink : IDisposable
     DateTime _lastDeviceAt = DateTime.MinValue;
     DateTime _lastHelloAt = DateTime.MinValue;
     DateTime _lastStatusAt = DateTime.MinValue;
-    DateTime _lastNetAt = DateTime.MinValue;
     DateTime _lastScanAt = DateTime.MinValue;
     List<byte[]> _nameFrames;          // pending #NAMES/#NAMEROW lines
     int _nameFramesSent;
     DateTime _lastNameRequestAt = DateTime.MinValue;
 
-    public SerialLink(StatusService service, NetSpeedMonitor netMonitor, StockMonitor stockMonitor)
+    public SerialLink(StatusService service, StockMonitor stockMonitor, BilibiliMonitor upMonitor)
     {
         _service = service;
-        _netMonitor = netMonitor;
         _stockMonitor = stockMonitor;
+        _upMonitor = upMonitor;
     }
 
     public bool IsLinked => _linked;
@@ -83,7 +83,11 @@ sealed class SerialLink : IDisposable
     public bool TrySendCommand(Dictionary<string, object> command)
     {
         if (!_linked) return false;
-        return SendFrame("#CMD ", JsonSerializer.SerializeToUtf8Bytes(command));
+        if (!SendFrame("#CMD ", JsonSerializer.SerializeToUtf8Bytes(command))) return false;
+        // The regular #HELLO cadence is 3s. Ask for the new screen state now
+        // so the mirror does not wait for that timer after a tab switch.
+        if (command.ContainsKey("display")) SendFrame("#HELLO", null);
+        return true;
     }
 
     async Task Run()
@@ -93,7 +97,7 @@ sealed class SerialLink : IDisposable
             try
             {
                 Tick();
-                await Task.Delay(250, _stop.Token);
+                await Task.Delay(150, _stop.Token);
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
             {
@@ -138,18 +142,46 @@ sealed class SerialLink : IDisposable
         }
         if (!_linked) return;
 
+        // Auto mode rotates the UP page in while idle (firmware 0.4.20+), so
+        // keep its data warm then too. Activate() still honours every gate.
+        if (_deviceInfo is { Effective: "up" } or { Mode: "auto" }) _ = _upMonitor.Activate();
+        bool regularFrame = false;
+
         if (now - _lastStatusAt >= StatusInterval)
         {
             _lastStatusAt = now;
             SendFrame("#STATUS ", _service.Snapshot().ToJson());
             SendFrame("#STOCK ", _stockMonitor.ToJson());
+            SendFrame("#UP ", _upMonitor.ToJson());
+            regularFrame = true;
         }
-        if (now - _lastNetAt >= NetInterval)
+        if (_nameFrames != null) PumpNameFrames();
+        else if (!regularFrame) PumpUpFrames();
+    }
+
+    void PumpUpFrames()
+    {
+        if (_upFrames == null) return;
+        int sentBytes = 0;
+        while (_upFramesSent < _upFrames.Count)
         {
-            _lastNetAt = now;
-            SendFrame("#NET ", _netMonitor.ToJson(SystemStatsMonitor.Snapshot()));
+            var line = _upFrames[_upFramesSent];
+            if (sentBytes + line.Length + 1 > UpScreenFrames.BurstBudget) break;
+            if (!SendLine(line)) { _upFrames = null; return; }
+            sentBytes += line.Length + 1; _upFramesSent++;
         }
-        PumpNameFrames();
+        if (_upFramesSent == _upFrames.Count) _upFrames = null;
+    }
+
+    void HandleWantUp(string args)
+    {
+        if (_upFrames != null || DateTime.UtcNow - _lastUpRequestAt < TimeSpan.FromSeconds(3)) return;
+        _lastUpRequestAt = DateTime.UtcNow;
+        var frame = _upMonitor.Screen;
+        if (!int.TryParse(args.Trim(), out var wanted) || wanted != frame.Revision)
+        { SendFrame("#UP ", _upMonitor.ToJson()); return; }
+        _upFrames = UpScreenFrames.Build(frame.Pixels, frame.Revision);
+        _upFramesSent = 0;
     }
 
     /// Trickles the queued name-strip rows out behind the regular frames.
@@ -313,6 +345,15 @@ sealed class SerialLink : IDisposable
 
     void HandleLine(string line)
     {
+        if (line.StartsWith("#WANTUP ", StringComparison.Ordinal))
+        { HandleWantUp(line[8..]); return; }
+        if (line.StartsWith("#UPOK ", StringComparison.Ordinal))
+        { Log.Write($"[serial] device received UP screen rev {line[6..].Trim()}"); return; }
+        if (line.StartsWith("#NAMESOK ", StringComparison.Ordinal))
+        {
+            Log.Write($"[serial] device received name strips rev {line[9..].Trim()}");
+            return;
+        }
         if (line.StartsWith("#WANTNAMES", StringComparison.Ordinal))
         {
             HandleWantNames(line.Length > 10 ? line[10..] : "");
@@ -333,10 +374,7 @@ sealed class SerialLink : IDisposable
             _linked = true;
             Settings.Set(PortKey, _portName);
             _lastStatusAt = DateTime.MinValue;
-            _lastNetAt = DateTime.MinValue;
-            // ip/ssid/bridge matter even on a USB link: the stock page's CJK
-            // name strips are fetched by the device over HTTP, so they need
-            // WiFi and a bridge host regardless of how the prices arrive.
+            // Keep ip/ssid/bridge in the diagnostic line for WiFi fallback.
             Log.Write($"[serial] linked {_portName}, fw={info.Firmware}, "
                       + $"ip={(info.Ip.Length > 0 ? info.Ip : "-")}, "
                       + $"ssid={(info.Ssid.Length > 0 ? info.Ssid : "-")}, "
@@ -392,6 +430,8 @@ sealed class SerialLink : IDisposable
         lock (_stateLock) _deviceInfo = null;
         _rx.Clear();
         _nameFrames = null;          // the device will ask again after re-linking
+        _upFrames = null;
+        _lastUpRequestAt = DateTime.MinValue;
         _lastNameRequestAt = DateTime.MinValue;
     }
 

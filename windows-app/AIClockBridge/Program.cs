@@ -15,6 +15,16 @@ static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        if (args.Contains("--bilibili-login"))
+        {
+            ApplicationConfiguration.Initialize();
+            var sessions = new BilibiliSessionStore();
+            using var monitor = new BilibiliMonitor(sessionStore: sessions);
+            using var browser = new BilibiliBrowserForm(monitor, sessions, hideOnClose: false);
+            monitor.VideoBrowser = browser;
+            Application.Run(browser);
+            return;
+        }
         if (args.Length >= 3 && args[0] == "--test-pet")
         {
             Environment.Exit(TestPet(args).GetAwaiter().GetResult());
@@ -57,16 +67,23 @@ static class Program
         // from under an existing Run entry. Repoint it at this build.
         AutoStart.SelfHeal();
 
+        // Same idea for the Claude status hook script this build ships.
+        var hookRefresh = ClaudeHooks.RefreshScript();
+        if (hookRefresh != null) Log.Write($"[hooks] claude status script {hookRefresh}");
+
         var service = new StatusService();
         var usage = new UsageFetcher();
         service.Usage = usage;
-        var netMonitor = new NetSpeedMonitor();
-        netMonitor.Start();
         var stockMonitor = new StockMonitor();
         stockMonitor.Start();
+        var upSessions = new BilibiliSessionStore();
+        using var upMonitor = new BilibiliMonitor(sessionStore: upSessions);
+        using var upBrowser = new BilibiliBrowserForm(upMonitor, upSessions);
+        upMonitor.VideoBrowser = upBrowser;
+        upMonitor.Start();
         using var screenPower = new WindowsScreenPowerController();
         service.ScreenOnProvider = () => screenPower.ScreenOn;
-        using var serialLink = new SerialLink(service, netMonitor, stockMonitor);
+        using var serialLink = new SerialLink(service, stockMonitor, upMonitor);
         DeviceClient.Serial = serialLink;
         serialLink.Start();
 
@@ -75,12 +92,13 @@ static class Program
             {
                 ["/"] = () => service.Snapshot().ToJson(),
                 ["/status"] = () => service.Snapshot().ToJson(),
-                ["/net"] = () => netMonitor.ToJson(SystemStatsMonitor.Snapshot()),
                 ["/stock"] = () => stockMonitor.ToJson(),
+                ["/up"] = () => { _ = upMonitor.Activate(); return upMonitor.ToJson(); },
             },
             binaryRoutes: new()
             {
                 ["/stock/names.raw"] = () => stockMonitor.NamesRgb565,
+                ["/up/screen.raw"] = () => upMonitor.RawScreen(),
             },
             postRoutes: new()
             {
@@ -120,7 +138,7 @@ static class Program
         // outright when no device is configured yet.
         server.OnRequest = (path, ip) =>
         {
-            if (path != "/status" && path != "/net" && path != "/stock") return;
+            if (path != "/status" && path != "/stock" && path != "/up") return;
             if (ip == "127.0.0.1" || ip == "::1" || ip.Length == 0) return;
             DeviceClient.DevicePollAt = DateTime.UtcNow;
             DeviceClient.LastSeenIp = ip;
@@ -166,7 +184,7 @@ static class Program
         using var bindRetryHandle = bindRetry;
 
         var context = new TrayAppContext(
-            service, usage, netMonitor, stockMonitor, screenPower, Port);
+            service, usage, stockMonitor, upMonitor, screenPower, Port, upBrowser);
         usage.StartAutoRefresh();
         Application.Run(context);
     }

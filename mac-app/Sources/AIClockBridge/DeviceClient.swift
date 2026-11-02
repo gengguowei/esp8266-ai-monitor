@@ -289,7 +289,7 @@ final class DeviceClient {
 
     // MARK: - pairing watchdog
 
-    /// Stamped on every device poll of our /status|/net|/stock (see main.swift).
+    /// Stamped on every device poll of our /status|/stock (see main.swift).
     static var devicePollAt = Date.distantPast
 
     private static var healInFlight = false

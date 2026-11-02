@@ -17,12 +17,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
     private var modeItems: [String: NSMenuItem] = [:]
 
-    init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
+    init(service: StatusService, usage: UsageFetcher,
          stockMonitor: StockMonitor, port: UInt16) {
         self.service = service
         self.usage = usage
         self.port = port
-        self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
+        self.mirrorPopover = MirrorPopoverController(service: service,
                                                      stockMonitor: stockMonitor)
         super.init()
         buildMenu()
@@ -79,8 +79,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(makeItem("打开设备网页", #selector(openDevicePage)))
 
         let displayMenu = NSMenu()
-        for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-                              ("固定 Codex", "codex"), ("网速曲线", "net"),
+        for (title, mode) in [("自动（开盘看股票，工作看助手）", "auto"), ("固定 Claude", "claude"),
+                              ("固定 Codex", "codex"),
                               ("股票行情", "stock")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
@@ -171,8 +171,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             case let .success(info):
                 let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
                                info.codexCustomSprite ? "X:自定义" : "X:默认"]
-                let showing = info.mode == "net" ? "网速"
-                    : info.mode == "stock" ? "股票"
+                let showing = info.effective == "stock" ? "股票"
                     : (info.showing == "claude" ? "Claude" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"

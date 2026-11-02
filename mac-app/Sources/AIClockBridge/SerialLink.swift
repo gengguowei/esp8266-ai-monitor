@@ -4,7 +4,7 @@ import Foundation
 // isolation - or for skipping WiFi setup entirely. Scans for CH340-style
 // serial ports, handshakes, then pushes the same payloads the device would
 // otherwise poll over HTTP, as newline-terminated frames:
-//   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
+//   bridge -> device:  #HELLO   #STATUS {json}   #STOCK {json}   #CMD {json}
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
 // Device log lines (anything not starting with '#') are ignored.
 //
@@ -12,7 +12,6 @@ import Foundation
 // but quit the app before flashing to avoid the two readers fighting.
 final class SerialLink {
     private let service: StatusService
-    private let netMonitor: NetSpeedMonitor
     private let stockMonitor: StockMonitor
 
     private var fd: Int32 = -1
@@ -21,13 +20,11 @@ final class SerialLink {
     private var openedAt = Date.distantPast
     private var lastHelloAt = Date.distantPast
     private var lastStatusAt = Date.distantPast
-    private var lastNetAt = Date.distantPast
     private var rxBuf = Data()
     private var timer: Timer?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor) {
+    init(service: StatusService, stockMonitor: StockMonitor) {
         self.service = service
-        self.netMonitor = netMonitor
         self.stockMonitor = stockMonitor
     }
 
@@ -63,11 +60,6 @@ final class SerialLink {
             lastStatusAt = now
             send(frame("#STATUS ", service.snapshot().jsonData()))
             send(frame("#STOCK ", stockMonitor.jsonData()))
-        }
-        if now.timeIntervalSince(lastNetAt) > 2 {
-            lastNetAt = now
-            let stats = SystemStatsMonitor.shared.snapshot()
-            send(frame("#NET ", netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)))
         }
     }
 
@@ -155,7 +147,6 @@ final class SerialLink {
                 if !linked {
                     linked = true
                     lastStatusAt = .distantPast // push a status immediately
-                    lastNetAt = .distantPast
                     FileHandle.standardError.write(Data("[serial] linked \(portPath): \(line)\n".utf8))
                 }
             }

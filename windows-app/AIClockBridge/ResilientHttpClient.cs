@@ -25,15 +25,17 @@ sealed class ResilientHttpClient
     readonly object _lock = new();
     readonly string _name;
     readonly TimeSpan _timeout;
+    readonly bool _useSystemProxy;
 
     HttpClient _client;
     int _failures;
     DateTime _lastRebuild = DateTime.MinValue;
 
-    public ResilientHttpClient(string name, TimeSpan timeout)
+    public ResilientHttpClient(string name, TimeSpan timeout, bool useSystemProxy = true)
     {
         _name = name;
         _timeout = timeout;
+        _useSystemProxy = useSystemProxy;
     }
 
     public HttpClient Client
@@ -71,8 +73,9 @@ sealed class ResilientHttpClient
         {
             PooledConnectionLifetime = PooledConnectionLifetime,
         };
-        SystemProxy.Configure(handler);
-        Log.Write($"[http:{_name}] new client ({why}); system proxy is {SystemProxy.Describe()}");
+        if (_useSystemProxy) SystemProxy.Configure(handler);
+        else handler.UseProxy = false;
+        Log.Write($"[http:{_name}] new client ({why}); path is {(_useSystemProxy ? SystemProxy.Describe() : "direct")}");
         return new HttpClient(handler) { Timeout = _timeout };
     }
 }

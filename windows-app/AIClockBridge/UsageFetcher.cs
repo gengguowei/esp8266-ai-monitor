@@ -28,8 +28,12 @@ class ProviderUsage
     public bool AuthenticationError;
     public bool DesktopCache;
 
-    /// Measured on a real MSIX install: Claude Desktop appends a sample every
-    /// 15.00 minutes, on a fixed clock (…:11:45, :26:45, :41:45, …).
+    /// Claude Desktop appends a sample every 15 minutes (5 shortly after an
+    /// interaction) - but only while its background poll runs. Desktop 4.x
+    /// pauses that poll unless its tray usage view was opened within a
+    /// server-configured window (observed: 24h, key planUsageLastTrayOpenAt in
+    /// Desktop's config.json) and skips it while the PC is idle for 10 minutes.
+    /// Outside that window the cache gets a single sample at Desktop startup.
     public static readonly TimeSpan DesktopSampleInterval = TimeSpan.FromMinutes(15);
 
     /// Must clear TWO sampling intervals. The old threshold was 15 minutes -
@@ -85,6 +89,7 @@ sealed class UsageFetcher
     readonly Gate _claudeGate = new();
     readonly Gate _codexGate = new();
     DateTime _claudeApiOkAt = DateTime.MinValue;      // last good OAuth reading
+    string _claudeAuthError;                          // see ClaudeAuthError
 
     // Three cadences, deliberately different.
     //  - DesktopPollInterval: the Claude Desktop quota cache is a local file, so
@@ -154,6 +159,25 @@ sealed class UsageFetcher
 
     public ProviderUsage Claude { get { lock (_lock) return _claude; } }
     public ProviderUsage Codex { get { lock (_lock) return _codex; } }
+
+    /// The CLI OAuth credential failure that is keeping the live Claude source
+    /// down, or null. Read off the raw network result, not the displayed
+    /// reading: on a Desktop fallback the latter carries no auth flag. Only a
+    /// successful fetch clears it, so a 429 in between does not end the episode.
+    public string ClaudeAuthError { get { lock (_lock) return _claudeAuthError; } }
+
+    /// Repeat interval for the credential notice. That source was dead for three
+    /// weeks (2026-10-09 → 11-02) with nothing but tray-menu text to show for it.
+    internal static readonly TimeSpan ClaudeAuthNoticeInterval = TimeSpan.FromHours(24);
+
+    /// Notify only while the failure actually costs the user their quota: the
+    /// Desktop cache may still be covering it, and a Desktop-only setup with
+    /// no CLI login must not be nagged as long as that cache stays fresh.
+    internal static bool ClaudeAuthNoticeDue(string authError, ProviderUsage shown,
+                                             DateTime now, DateTime? lastNoticeAt) =>
+        authError != null
+        && !(HasNumbers(shown) && !shown.DesktopStale)
+        && (lastNoticeAt == null || now - lastNoticeAt.Value >= ClaudeAuthNoticeInterval);
 
     /// Raised on the UI thread after either provider updates.
     public Action OnUpdate;
@@ -232,6 +256,8 @@ sealed class UsageFetcher
                 // error (network hiccup / 429) - stale quota beats no quota.
                 if (claude != null) _claude = Merge(_claude, claude);
                 if (codex != null) _codex = Merge(_codex, codex);
+                if (HasNumbers(api)) _claudeAuthError = null;
+                else if (api is { AuthenticationError: true }) _claudeAuthError = api.Error;
                 mergedClaude = _claude;
                 mergedCodex = _codex;
                 _fetching = false;

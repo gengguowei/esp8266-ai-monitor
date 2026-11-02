@@ -28,19 +28,9 @@ sealed class MirrorControl : Control
     public string Line2 = "Weekly -";
     public bool ShowingClaude = true;
     public bool DeviceOK;
-    // net-mode mirror: same scrolling area-chart model as the firmware —
-    // one column per 250ms sample, 224-column (56s) window, shared "nice"
-    // full-scale, dim-green download area + yellow upload line.
-    public bool NetMode;
-    public int NetCPU = -1; // -1 = hidden (CPU/MEM row disabled in the menu)
-    public int NetMem = -1;
-    public string NetHeaderDL = "0B";
-    public string NetHeaderUL = "0B";
-    const int NetCols = 224; // NET_CHART_W
-    double[] _histRx = new double[NetCols];
-    double[] _histTx = new double[NetCols];
-
     public bool StockMode;
+    public bool UpMode;
+    public Bitmap UpFrame;
     public StockMonitor.Row[] StockRows = Array.Empty<StockMonitor.Row>();
 
     static readonly Image ClaudeLogo = LoadAsset("claude-logo.png");
@@ -66,24 +56,6 @@ sealed class MirrorControl : Control
         return Image.FromStream(stream);
     }
 
-    public void ResetNetSweep()
-    {
-        _histRx = new double[NetCols];
-        _histTx = new double[NetCols];
-    }
-
-    public void PushNetSample(double rx, double tx)
-    {
-        Array.Copy(_histRx, 1, _histRx, 0, NetCols - 1);
-        _histRx[NetCols - 1] = rx;
-        Array.Copy(_histTx, 1, _histTx, 0, NetCols - 1);
-        _histTx[NetCols - 1] = tx;
-        Invalidate();
-    }
-
-    /// Firmware's adaptiveNetScale: the window peak sits at ~87% of the chart.
-    static double AdaptiveNetScale(double maxV) => Math.Max(maxV * 1.15, 10240);
-
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
@@ -99,9 +71,9 @@ sealed class MirrorControl : Control
             g.SetClip(panel);
         }
 
-        if (NetMode)
+        if (UpMode)
         {
-            DrawNetScene(g);
+            if (UpFrame != null) g.DrawImage(UpFrame, new Rectangle(0, 0, 240, 240));
             return;
         }
         if (StockMode)
@@ -171,104 +143,6 @@ sealed class MirrorControl : Control
         }
     }
 
-    /// Replica of the firmware's net-speed screen v2: header readouts, then
-    /// a 224x128 area chart at (8,60) — dim-green DL fill with bright top
-    /// edge, 2px yellow UL line, quarter gridlines, shared nice scale.
-    void DrawNetScene(Graphics g)
-    {
-        var grey = Color.FromArgb(140, 140, 140);
-        using var greyBrush = new SolidBrush(grey);
-        using var labelFont = new Font("Consolas", 8, FontStyle.Regular, GraphicsUnit.Pixel);
-
-        g.DrawString("DOWN", labelFont, greyBrush, 14, 8);
-        g.DrawString("UP", labelFont, greyBrush, 134, 8);
-        using (var valueFont = new Font("Consolas", 19, FontStyle.Bold, GraphicsUnit.Pixel))
-        using (var greenBrush = new SolidBrush(Green))
-        using (var yellowBrush = new SolidBrush(Yellow))
-        {
-            g.DrawString(NetHeaderDL + "/s", valueFont, greenBrush, 12, 19);
-            g.DrawString(NetHeaderUL + "/s", valueFont, yellowBrush, 132, 19);
-        }
-
-        const float cx = 8, cy = 60, cw = 224, ch = 128;
-        var scale = AdaptiveNetScale(Math.Max(_histRx.Max(), _histTx.Max()));
-
-        // quarter gridlines
-        using (var grid = new Pen(Color.FromArgb(41, 41, 41), 1))
-        {
-            for (int q = 1; q <= 3; q++)
-            {
-                var y = cy + ch * q / 4;
-                g.DrawLine(grid, cx, y, cx + cw, y);
-            }
-        }
-
-        // 3-tap smoothed points, one per column (matches the device)
-        PointF[] Points(double[] vals)
-        {
-            var pts = new PointF[NetCols];
-            for (int i = 0; i < NetCols; i++)
-            {
-                var lo = Math.Max(0, i - 1);
-                var hi = Math.Min(NetCols - 1, i + 1);
-                var v = (vals[lo] + vals[i] + vals[hi]) / 3;
-                var hgt = (float)Math.Min(v / scale, 1) * (ch - 2);
-                pts[i] = new PointF(cx + i, cy + ch - 1 - hgt);
-            }
-            return pts;
-        }
-
-        // download: filled area + bright top edge
-        var dl = Points(_histRx);
-        using (var path = new GraphicsPath())
-        {
-            path.AddLine(cx, cy + ch - 1, dl[0].X, dl[0].Y);
-            path.AddLines(dl);
-            path.AddLine(dl[^1].X, dl[^1].Y, cx + cw - 1, cy + ch - 1);
-            path.CloseFigure();
-            using var fill = new SolidBrush(Color.FromArgb(0, 84, 0));
-            g.FillPath(fill, path);
-        }
-        // NOT the firmware's LINE_T: the mirror window is ~4x the panel's
-        // physical size, so a thin stroke here matches the device visually.
-        using (var pen = new Pen(Green, 3) { LineJoin = LineJoin.Round })
-        {
-            g.DrawLines(pen, dl);
-        }
-
-        // upload: yellow line
-        var ul = Points(_histTx);
-        using (var pen = new Pen(Yellow, 3) { LineJoin = LineJoin.Round })
-        {
-            g.DrawLines(pen, ul);
-        }
-
-        // axis + footer labels
-        using (var right = new StringFormat { Alignment = StringAlignment.Far })
-        {
-            g.DrawString(DeviceSpeedText(scale), labelFont, greyBrush,
-                         new RectangleF(120, 46, 112, 12), right);
-        }
-        using (var center = new StringFormat { Alignment = StringAlignment.Center })
-        {
-            if (NetCPU >= 0)
-            {
-                // fixed-x label + value columns, so a value width change (5%
-                // -> 30%) never shifts the rest of the row (matches firmware)
-                using var sysLabelFont = new Font("Consolas", 7f);
-                using var sysValueFont = new Font("Consolas", 11.5f, FontStyle.Bold);
-                g.DrawString("CPU", sysLabelFont, greyBrush, 28, 196);
-                g.DrawString($"{NetCPU}%", sysValueFont, Brushes.White, 62, 189);
-                g.DrawString("MEM", sysLabelFont, greyBrush, 130, 196);
-                g.DrawString($"{NetMem}%", sysValueFont, Brushes.White, 164, 189);
-            }
-            g.DrawString("PC NET  -  56s", labelFont, greyBrush,
-                         new RectangleF(0, 212, 240, 12), center);
-        }
-    }
-
-    // Stock watchlist, same 54px rows as the firmware: grey code (the mirror
-    // can render the CJK name next to it), big white price, colored change.
     void DrawStockScene(Graphics g)
     {
         using var greyBrush = new SolidBrush(Color.FromArgb(140, 140, 140));
@@ -299,14 +173,6 @@ sealed class MirrorControl : Control
         g.DrawString("STOCKS", labelFont, greyBrush, new RectangleF(0, 226, 240, 12), center);
     }
 
-    /// Same compact unit strings the firmware prints ("2.3M", "480K").
-    public static string DeviceSpeedText(double bps)
-    {
-        if (bps >= 1_000_000) return $"{bps / 1_000_000:F1}M";
-        if (bps >= 1_000) return $"{bps / 1_000:F0}K";
-        return $"{bps:F0}B";
-    }
-
     static GraphicsPath RoundedRect(RectangleF r, float radius)
     {
         var path = new GraphicsPath();
@@ -325,15 +191,22 @@ sealed class MirrorControl : Control
 sealed class MirrorForm : Form
 {
     readonly StatusService _service;
-    readonly NetSpeedMonitor _netMonitor;
     readonly StockMonitor _stockMonitor;
+    readonly BilibiliMonitor _upMonitor;
+    int _upRevision = -1;
     readonly MirrorControl _mirror = new();
     readonly RadioButton[] _modeButtons;
-    static readonly string[] Modes = { "auto", "claude", "codex", "net", "stock" };
-    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "股票" };
+    static readonly string[] Modes = { "auto", "claude", "codex", "stock", "up" };
+    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "股票", "UP主" };
     readonly Label _statusLabel = new();
     readonly TrackBar _brightness = new() { Minimum = 0, Maximum = 100, TickStyle = TickStyle.None };
     readonly Label _brightnessValue = new();
+    readonly Button _upFetchButton = new() { Text = "立即获取", Visible = false };
+    readonly ToolTip _upTooltip = new();
+    readonly Control[] _bottomControls;
+    bool _upControlsShown;
+    string _upActionMessage;
+    DateTime _upActionUntil;
     // Drag streams many scroll events; posts to the single-threaded ESP8266 web
     // server are throttled mid-drag and the final value always flushes on mouse-up.
     int? _pendingBrightness;
@@ -341,21 +214,21 @@ sealed class MirrorForm : Form
 
     readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 1000 };
     readonly System.Windows.Forms.Timer _animTimer = new() { Interval = 120 };
-    readonly System.Windows.Forms.Timer _sweepTimer = new()
-    {
-        Interval = (int)(NetSpeedMonitor.SampleInterval * 1000),
-    };
-
     readonly Dictionary<string, (int Rev, List<Bitmap> Frames, int W, int H)> _spriteCache = new();
     DeviceInfo _lastInfo;
-    string _fetchingSlot;
+    StatusSnapshot _latestSnapshot;
+    readonly HashSet<string> _fetchingSlots = new();
     bool _applyingMode; // suppress CheckedChanged while reflecting device state
+    bool _tickRunning, _tickAgain;
+    bool _modePumpRunning;
+    string _pendingMode, _requestedMode, _visibleShowing;
+    DateTime _modeRequestedAt;
 
-    public MirrorForm(StatusService service, NetSpeedMonitor netMonitor, StockMonitor stockMonitor)
+    public MirrorForm(StatusService service, StockMonitor stockMonitor, BilibiliMonitor upMonitor)
     {
         _service = service;
-        _netMonitor = netMonitor;
         _stockMonitor = stockMonitor;
+        _upMonitor = upMonitor;
 
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -370,9 +243,12 @@ sealed class MirrorForm : Form
         Controls.Add(_mirror);
 
         _modeButtons = new RadioButton[Modes.Length];
-        var segWidth = Px(288) / Modes.Length;
+        // Five readable tags over two rows; do not squeeze Claude/Codex into
+        // 48px buttons or rely on clipping at high DPI.
+        ClientSize = new Size(Px(316), Px(454));
         for (int i = 0; i < Modes.Length; i++)
         {
+            var segWidth = Px(288) / (i < 3 ? 3 : 2);
             var btn = new RadioButton
             {
                 Appearance = Appearance.Button,
@@ -381,7 +257,7 @@ sealed class MirrorForm : Form
                 Tag = Modes[i],
                 AutoSize = false,
             };
-            btn.SetBounds(Px(14) + i * segWidth, Px(312), segWidth, Px(28));
+            btn.SetBounds(Px(14) + (i < 3 ? i : i - 3) * segWidth, Px(306 + i / 3 * 30), segWidth, Px(28));
             btn.CheckedChanged += ModeChanged;
             _modeButtons[i] = btn;
             Controls.Add(btn);
@@ -413,15 +289,62 @@ sealed class MirrorForm : Form
         _statusLabel.Text = "连接设备中…";
         _statusLabel.AutoEllipsis = true;
         Controls.Add(_statusLabel);
+        _bottomControls = new Control[] { sunLabel, _brightness, _brightnessValue, _statusLabel };
+        foreach (Control control in _bottomControls)
+            control.Top += Px(30);
+        _upFetchButton.SetBounds(Px(14), Px(370), Px(288), Px(28));
+        _upFetchButton.Click += async (_, _) => await FetchUpNow();
+        Controls.Add(_upFetchButton);
 
         _pollTimer.Tick += async (_, _) => await Tick();
         _animTimer.Tick += (_, _) => AnimTick();
-        _sweepTimer.Tick += (_, _) => SweepTick();
         Deactivate += (_, _) => HidePopup(); // transient, like NSPopover
     }
 
     float ScaleF() => DeviceDpi / 96f;
     int Px(int logical) => (int)Math.Round(logical * ScaleF());
+
+    void SetUpControls(bool shown)
+    {
+        if (_upControlsShown == shown) return;
+        _upControlsShown = shown;
+        var delta = Px(shown ? 30 : -30);
+        foreach (var control in _bottomControls) control.Top += delta;
+        _upFetchButton.Visible = shown;
+        ClientSize = new Size(Px(316), Px(shown ? 484 : 454));
+        if (Visible) Top -= delta;
+    }
+
+    async Task FetchUpNow()
+    {
+        _upFetchButton.Enabled = false;
+        _upFetchButton.Text = "获取中…";
+        _upActionMessage = "正在获取 UP主数据…";
+        _upActionUntil = DateTime.MaxValue;
+        ShowUpStatus();
+        try
+        {
+            _upActionMessage = await _upMonitor.FetchNow();
+            _upActionUntil = DateTime.Now.AddSeconds(12);
+            if (_mirror.UpMode) { ApplyUpFrame(); ShowUpStatus(); }
+        }
+        finally { _upFetchButton.Enabled = true; _upFetchButton.Text = "立即获取"; }
+    }
+
+    void ShowUpStatus()
+    {
+        if (!_mirror.UpMode) return;
+        var profile = _upMonitor.Snapshot;
+        _statusLabel.Text = DateTime.Now < _upActionUntil ? _upActionMessage :
+            _upMonitor.IsFetching ? "正在获取 UP主数据…" :
+            _upMonitor.Error != null ? $"UP主 · {_upMonitor.Error}（保留缓存）" :
+            !string.IsNullOrEmpty(_upMonitor.SourceWarning) ? "UP主 · " + _upMonitor.SourceWarning :
+            profile.VideoCheckedAt.HasValue ? $"UP主 · 更新于 {profile.VideoCheckedAt.Value.ToLocalTime():HH:mm} · 低频刷新" :
+            "UP主 · 等待首次获取";
+        if (_lastInfo?.SupportsUp == false && DateTime.Now >= _upActionUntil)
+            _statusLabel.Text = "UP主预览 · 设备需固件 0.4.17 或更新版本";
+        _upTooltip.SetToolTip(_statusLabel, _statusLabel.Text + "\n" + _upMonitor.SourcesSummary);
+    }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -447,7 +370,6 @@ sealed class MirrorForm : Form
         Activate();
         _pollTimer.Start();
         _animTimer.Start();
-        _sweepTimer.Start();
         _ = Tick();
     }
 
@@ -456,7 +378,6 @@ sealed class MirrorForm : Form
         Hide();
         _pollTimer.Stop();
         _animTimer.Stop();
-        _sweepTimer.Stop();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -497,21 +418,22 @@ sealed class MirrorForm : Form
         _brightnessValue.Text = $"{level}%";
     }
 
-    /// One sweep step: push the newest 4Hz sample, refresh the DL/UL readout.
-    void SweepTick()
+    async Task Tick()
     {
-        if (!_mirror.NetMode || !Visible) return;
-        var cur = _netMonitor.Current;
-        var smoothed = _netMonitor.CurrentSmoothed;
-        _mirror.NetHeaderDL = MirrorControl.DeviceSpeedText(smoothed.Rx);
-        _mirror.NetHeaderUL = MirrorControl.DeviceSpeedText(smoothed.Tx);
-        var (cpu, mem) = SystemStatsMonitor.Snapshot(); // internally 1s-cached
-        _mirror.NetCPU = cpu;
-        _mirror.NetMem = mem;
-        _mirror.PushNetSample(cur.Rx, cur.Tx);
+        if (_tickRunning) { _tickAgain = true; return; }
+        _tickRunning = true;
+        try
+        {
+            do
+            {
+                _tickAgain = false;
+                await RefreshInfo();
+            } while (_tickAgain && Visible);
+        }
+        finally { _tickRunning = false; }
     }
 
-    async Task Tick()
+    async Task RefreshInfo()
     {
         DeviceInfo info;
         try
@@ -521,47 +443,60 @@ sealed class MirrorForm : Form
         catch (Exception)
         {
             if (!Visible) return;
+            if (_requestedMode == "up" || _mirror.UpMode) ApplyUpFrame();
             _mirror.DeviceOK = false;
             _mirror.Invalidate();
             _statusLabel.Text = DeviceClient.Host.Length == 0
                 ? "未设置设备地址（右键托盘 → 设置设备地址）" : $"无法连接 {DeviceClient.Host}";
+            if (_mirror.UpMode) ShowUpStatus();
             return;
         }
         if (!Visible) return;
+        // Snapshot can rescan large session-log trees every 5s. Do that off
+        // the WinForms thread; animation and click previews use this copy.
+        var snapshot = await Task.Run(() => _service.Snapshot());
+        if (!Visible) return;
+        _latestSnapshot = snapshot;
         _lastInfo = info;
         _mirror.DeviceOK = true;
-        ApplyScene(info);
-        EnsureSprite(info);
+        if (_requestedMode == info.Mode ||
+            (_requestedMode != null && !_modePumpRunning &&
+             DateTime.UtcNow - _modeRequestedAt > TimeSpan.FromSeconds(8) &&
+             !(_requestedMode == "up" && !info.SupportsUp)))
+            _requestedMode = null;
+        var requested = _requestedMode;
+        ApplyScene(info, requested);
+        EnsureSprite(info, requested);
         SyncBrightness(info);
-        var modeIdx = Math.Max(0, Array.IndexOf(Modes, info.Mode));
+        var modeIdx = Math.Max(0, Array.IndexOf(Modes, requested ?? info.Mode));
         _applyingMode = true;
         _modeButtons[modeIdx].Checked = true;
         _applyingMode = false;
-        var modeText = info.Mode == "auto" ? "自动切换"
-            : info.Mode == "net" ? "网速曲线" : "固定显示";
+        var modeText = (requested ?? info.Mode) == "auto" ? "自动切换" : "固定显示";
         _statusLabel.Text = $"{info.Transport} · {modeText}";
+        ShowUpStatus();
     }
 
     /// Quota lines & ring exactly as the firmware computes them from /status.
-    void ApplyScene(DeviceInfo info)
+    void ApplyScene(DeviceInfo info, string requested = null)
     {
-        var enteringNet = info.Effective == "net" && !_mirror.NetMode;
-        _mirror.NetMode = info.Effective == "net";
-        _mirror.StockMode = info.Effective == "stock";
+        var effective = requested is "claude" or "codex" or "stock" or "up"
+            ? requested : info.Effective;
+        var showing = requested is "claude" or "codex" ? requested : info.Showing;
+        _mirror.StockMode = effective == "stock";
+        _mirror.UpMode = effective == "up";
+        SetUpControls(_mirror.UpMode);
+        _visibleShowing = showing;
+        if (_mirror.UpMode) { ApplyUpFrame(); return; }
         if (_mirror.StockMode)
         {
             _mirror.StockRows = _stockMonitor.Snapshot;
             _mirror.Invalidate();
             return;
         }
-        if (_mirror.NetMode)
-        {
-            if (enteringNet) _mirror.ResetNetSweep(); // fresh sweep, like the device
-            _mirror.Invalidate();
-            return;
-        }
-        var snap = _service.Snapshot();
-        _mirror.ShowingClaude = info.Showing != "codex";
+        var snap = _latestSnapshot;
+        if (snap == null) return;
+        _mirror.ShowingClaude = showing != "codex";
         if (_mirror.ShowingClaude)
         {
             var pct = snap.Claude.FiveHourPct
@@ -595,9 +530,11 @@ sealed class MirrorForm : Form
     static string PctText(double? pct) =>
         pct.HasValue && pct.Value >= 0 ? $"{(int)pct.Value}%" : "-";
 
-    void EnsureSprite(DeviceInfo info)
+    void EnsureSprite(DeviceInfo info, string requested = null)
     {
-        var slot = info.Showing == "codex" ? "codex" : "claude";
+        if (_mirror.StockMode || _mirror.UpMode) return;
+        var slot = (requested is "claude" or "codex" ? requested : info.Showing) == "codex"
+            ? "codex" : "claude";
         var w = slot == "claude" ? info.ClaudeW : info.CodexW;
         var h = slot == "claude" ? info.ClaudeH : info.CodexH;
         if (_spriteCache.TryGetValue(slot, out var cached) && cached.Rev == info.SpriteRev)
@@ -607,8 +544,12 @@ sealed class MirrorForm : Form
             _mirror.SpriteH = cached.H;
             return;
         }
-        if (_fetchingSlot == slot) return;
-        _fetchingSlot = slot;
+        if (_mirror.Frames.Count > 0)
+        {
+            _mirror.Frames = new(); // do not show the previous app's sprite while loading
+            _mirror.Invalidate();
+        }
+        if (!_fetchingSlots.Add(slot)) return;
         _ = FetchSprite(slot, info.SpriteRev, w, h);
     }
 
@@ -617,12 +558,12 @@ sealed class MirrorForm : Form
         try
         {
             var data = await DeviceClient.FetchSpriteRaw(slot);
-            var frames = Rgb565.DecodeSpriteFrames(data, w, h);
+            var frames = await Task.Run(() => Rgb565.DecodeSpriteFrames(data, w, h));
             if (frames.Count == 0) return;
             if (_spriteCache.TryGetValue(slot, out var old))
                 foreach (var f in old.Frames) f.Dispose();
             _spriteCache[slot] = (rev, frames, w, h);
-            if ((_lastInfo?.Showing == "codex" ? "codex" : "claude") == slot)
+            if (_visibleShowing == slot && !_mirror.StockMode && !_mirror.UpMode)
             {
                 _mirror.Frames = frames;
                 _mirror.SpriteW = w;
@@ -636,7 +577,7 @@ sealed class MirrorForm : Form
         }
         finally
         {
-            _fetchingSlot = null;
+            _fetchingSlots.Remove(slot);
         }
     }
 
@@ -644,7 +585,7 @@ sealed class MirrorForm : Form
 
     void AnimTick()
     {
-        if (_lastInfo == null || _mirror.NetMode) return;
+        if (_lastInfo == null || _latestSnapshot == null || _mirror.StockMode || _mirror.UpMode) return;
 
         // ~400ms red-border flash while an approval is pending (device cadence)
         if (_mirror.NeedsInput)
@@ -664,8 +605,8 @@ sealed class MirrorForm : Form
         }
 
         if (_mirror.Frames.Count == 0) return;
-        var snap = _service.Snapshot();
-        var working = _lastInfo.Showing == "codex"
+        var snap = _latestSnapshot;
+        var working = _visibleShowing == "codex"
             ? snap.Codex.Status == "working" : snap.Claude.Status == "working";
         if (working)
         {
@@ -678,17 +619,52 @@ sealed class MirrorForm : Form
         _mirror.Invalidate();
     }
 
-    async void ModeChanged(object sender, EventArgs e)
+    void ModeChanged(object sender, EventArgs e)
     {
         if (_applyingMode || sender is not RadioButton { Checked: true, Tag: string mode }) return;
+        _requestedMode = _pendingMode = mode;
+        _modeRequestedAt = DateTime.UtcNow;
+        _mirror.UpMode = mode == "up";
+        SetUpControls(_mirror.UpMode);
+        if (mode == "up") { _ = _upMonitor.Activate(); _mirror.UpMode = true; ApplyUpFrame(); }
+        if (_lastInfo != null)
+        {
+            ApplyScene(_lastInfo, mode);
+            EnsureSprite(_lastInfo, mode);
+        }
+        _ = PumpModeChanges();
+    }
+
+    void ApplyUpFrame()
+    {
+        SetUpControls(true);
+        _ = _upMonitor.Activate();
+        var frame = _upMonitor.Screen;
+        if (_upRevision != frame.Revision)
+        {
+            var bitmap = Rgb565.Decode(frame.Pixels, 0, 240, 240);
+            _mirror.UpFrame?.Dispose(); _mirror.UpFrame = bitmap; _upRevision = frame.Revision;
+        }
+        _mirror.Invalidate();
+    }
+
+    async Task PumpModeChanges()
+    {
+        if (_modePumpRunning) return;
+        _modePumpRunning = true;
         try
         {
-            await DeviceClient.SetDisplayMode(mode);
+            while (_pendingMode != null)
+            {
+                await Task.Delay(80); // coalesce a burst of tab clicks
+                var mode = _pendingMode;
+                _pendingMode = null;
+                if (mode == "up" && _lastInfo?.SupportsUp == false) continue;
+                try { await Task.Run(() => DeviceClient.SetDisplayMode(mode)); }
+                catch (Exception) { if (_requestedMode == mode) _requestedMode = null; }
+            }
         }
-        catch (Exception)
-        {
-            // Tick() below re-syncs the buttons to the device's real state
-        }
+        finally { _modePumpRunning = false; }
         await Tick();
     }
 }

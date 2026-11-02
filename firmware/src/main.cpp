@@ -63,46 +63,37 @@ const int RING_MARGIN = 4;      // inset from screen edge
 const int RING_THICKNESS = 10;  // ring bar thickness
 const unsigned long ANIM_INTERVAL_MS = 120;  // sprite frame advance
 const unsigned long FLASH_INTERVAL_MS = 400; // "urgent" flash speed
-const unsigned long SWITCH_BOTH_MS = 2000;   // both apps working: alternate fast
-const unsigned long SWITCH_IDLE_MS = 6000;   // neither working: alternate slow
+const unsigned long SWITCH_IDLE_MS = 12000;  // neither working: alternate slow
+const unsigned long UP_IDLE_MS = 12000;      // auto mode: how long the UP slot holds
+// A working/idle flip only counts once it has held this long. The bridge polls
+// every 5s, so a change has to survive into a second poll before it can move
+// the screen - single-poll blips between turns no longer bounce the pet.
+const unsigned long WORK_DEBOUNCE_MS = 8000;
+// Floor on how long an app keeps the screen after a status-driven switch, so
+// two apps flipping in opposite directions cannot swap it instantly. A
+// needs-input prompt still overrides this.
+const unsigned long MIN_HOLD_MS = 3000;
 
 enum ActiveApp { APP_CLAUDE, APP_CODEX };
 ActiveApp currentApp = APP_CLAUDE;
 unsigned long lastSwitchMs = 0;
+unsigned long bridgeEpoch = 0;     // /status ts, Unix seconds from the host
+unsigned long bridgeEpochAtMs = 0; // millis() when that timestamp arrived
+// /status cn_trading_day: the bridge owns the exchange holiday table. The flag
+// only counts for the Beijing day it was sent on; any other day (or an older
+// bridge that never sends it) falls back to the plain weekday rule.
+int tradingDayFlag = -1;            // -1 unknown, 0 closed, 1 trading
+unsigned long tradingDayIndex = 0;  // Beijing days since the Unix epoch
+// Auto mode's idle rotation is Claude -> Codex -> UP -> Claude. While on the
+// UP slot currentApp stays where it was and effectiveMode() returns MODE_UP.
+bool upTurn = false;
 
 // Display override, settable from the desktop app via POST /api/display or USB:
 // auto = follow working status, claude/codex = pin that app on screen,
-// net/stock = show PC-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_STOCK };
+// stock/up = show bridge-rendered information instead of the pet.
+enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_STOCK, MODE_UP };
 DisplayMode displayMode = MODE_AUTO;
 DisplayMode lastEffectiveMode = MODE_AUTO;
-
-// ---------- net speed mode state ----------
-// Rendering is decoupled from the network: pollNet() fetches every 2s and
-// only refills a queue of 250ms samples (the bridge samples at 4Hz and tags
-// them with a running seq, so nothing is drawn twice or skipped). The sweep
-// itself consumes exactly one queued sample every NET_DRAW_INTERVAL_MS, so
-// the trace advances at a constant rate no matter how long HTTP takes.
-const unsigned long NET_POLL_INTERVAL_MS = 2000; // queue refill cadence
-const unsigned long NET_DRAW_INTERVAL_MS = 250;  // one chart step per bridge sample
-const int NET_QUEUE = 32;
-long netQRx[NET_QUEUE], netQTx[NET_QUEUE]; // ring buffer of pending samples
-int netQHead = 0, netQCount = 0;
-long netSeq = -1;                          // last bridge sample seq consumed into the queue
-long netCurRx = 0, netCurTx = 0;           // smoothed readout for the header
-int netCpuPct = -1, netMemPct = -1;        // Mac CPU/MEM row; -1 = bridge sends none (hidden)
-String netLastCpuVal, netLastMemVal;       // change detection for the CPU/MEM values
-bool netSysLabelsDrawn = false;
-unsigned long lastNetPollMs = 0;
-unsigned long lastNetDrawMs = 0;
-bool netChromeDrawn = false;
-bool netHeaderDirty = false;
-
-// Chart layout (task-manager style scrolling area chart, newest at the right)
-const int NET_CHART_X = 8, NET_CHART_Y = 60, NET_CHART_W = 224, NET_CHART_H = 128;
-long netHistRx[NET_CHART_W], netHistTx[NET_CHART_W]; // one 250ms sample per column
-long netScale = 10240;    // current "nice" full-scale value (whole chart shares it)
-String netLastDl, netLastUl, netLastScaleText; // change detection for partial redraws
 
 // ---------- stock watchlist mode state ----------
 // Rows come pre-formatted from the bridge (GET /stock or serial #STOCK):
@@ -863,288 +854,99 @@ void redrawRingOnly() {
   }
 }
 
+// Debounced working flag: `raw` has to hold its new value for
+// WORK_DEBOUNCE_MS before the filter reports it, so one stale or blipped poll
+// cannot reassign the screen. The first call seeds the filter, so whatever is
+// already running at boot shows immediately.
+struct WorkFilter {
+  bool stable = false;
+  bool pending = false;
+  bool primed = false;
+  unsigned long changedMs = 0;
+};
+WorkFilter claudeWork, codexWork;
+
+bool debouncedWorking(WorkFilter &f, bool raw, unsigned long now) {
+  if (!f.primed) {
+    f.primed = true;
+    f.stable = raw;
+    f.pending = raw;
+    f.changedMs = now;
+    return f.stable;
+  }
+  if (raw != f.pending) {
+    f.pending = raw;
+    f.changedMs = now;
+  }
+  if (raw != f.stable && now - f.changedMs >= WORK_DEBOUNCE_MS) {
+    f.stable = raw;
+  }
+  return f.stable;
+}
+
 // Who gets the screen:
 //   - display mode pinned (Mac app) -> that app, always
-//   - exactly one app working       -> that app, immediately
-//   - both working                  -> alternate every SWITCH_BOTH_MS (2s)
-//   - neither working               -> alternate slowly (SWITCH_IDLE_MS)
+//   - a needs-input prompt          -> that app, immediately
+//   - exactly one app working       -> that app, once the status has settled
+//   - both working                  -> keep the current app until it stops
+//   - neither working               -> rotate slowly (SWITCH_IDLE_MS); in auto
+//                                      mode the cycle is Claude -> Codex -> UP
+// Working/idle runs through WORK_DEBOUNCE_MS and every switch starts a
+// MIN_HOLD_MS floor, so a flapping status cannot strobe the screen.
 bool updateActiveApp() {
   ActiveApp desired = currentApp;
+  unsigned long now = millis();
+  // Always step the filters, even on the branches that ignore their result,
+  // so a pinned or needs-input stretch does not leave them stale.
+  bool claudeWorking = debouncedWorking(claudeWork, claudeStatus.status == "working", now);
+  bool codexWorking = debouncedWorking(codexWork, codexStatus.status == "working", now);
 
   if (displayMode == MODE_CLAUDE) {
     desired = APP_CLAUDE;
+    upTurn = false;
   } else if (displayMode == MODE_CODEX) {
     desired = APP_CODEX;
+    upTurn = false;
   } else if (claudeStatus.needsInput && !codexStatus.needsInput) {
     desired = APP_CLAUDE; // approval prompt wins the screen
+    upTurn = false;
   } else if (codexStatus.needsInput && !claudeStatus.needsInput) {
     desired = APP_CODEX;
+    upTurn = false;
+  } else if (now - lastSwitchMs < MIN_HOLD_MS) {
+    return false; // just switched - let the current app hold the screen
   } else {
-    bool claudeWorking = claudeStatus.status == "working";
-    bool codexWorking = codexStatus.status == "working";
+    if (claudeWorking || codexWorking) upTurn = false; // work ends the UP slot
     if (claudeWorking && !codexWorking) {
       desired = APP_CLAUDE;
     } else if (codexWorking && !claudeWorking) {
       desired = APP_CODEX;
-    } else {
-      unsigned long interval = (claudeWorking && codexWorking) ? SWITCH_BOTH_MS : SWITCH_IDLE_MS;
-      if (millis() - lastSwitchMs >= interval) {
-        lastSwitchMs = millis();
-        desired = (currentApp == APP_CLAUDE) ? APP_CODEX : APP_CLAUDE;
+    } else if (!claudeWorking && !codexWorking &&
+               now - lastSwitchMs >= (upTurn ? UP_IDLE_MS : SWITCH_IDLE_MS)) {
+      lastSwitchMs = now;
+      // Both prompting for input falls through to here too: keep alternating
+      // between them and never hide a prompt behind the UP page.
+      bool upAllowed = displayMode == MODE_AUTO &&
+                       !claudeStatus.needsInput && !codexStatus.needsInput;
+      if (upTurn) {
+        upTurn = false;
+        desired = APP_CLAUDE;
+      } else if (currentApp == APP_CLAUDE) {
+        desired = APP_CODEX;
+      } else if (upAllowed) {
+        upTurn = true; // Codex -> UP; currentApp stays, effectiveMode() switches
+      } else {
+        desired = APP_CLAUDE;
       }
     }
   }
 
   if (desired != currentApp) {
     currentApp = desired;
-    lastSwitchMs = millis();
+    lastSwitchMs = now;
     return true;
   }
   return false;
-}
-
-// ---------- net speed screen ----------
-
-String speedText(long bps) {
-  char buf[16];
-  if (bps >= 1000000) snprintf(buf, sizeof(buf), "%.1fM", bps / 1000000.0);
-  else if (bps >= 1000) snprintf(buf, sizeof(buf), "%.0fK", bps / 1000.0);
-  else snprintf(buf, sizeof(buf), "%ldB", bps);
-  return String(buf);
-}
-
-void resetNetChart() {
-  memset(netHistRx, 0, sizeof(netHistRx));
-  memset(netHistTx, 0, sizeof(netHistTx));
-  netScale = 10240;
-  netLastDl = "";
-  netLastUl = "";
-  netLastScaleText = "";
-  netLastCpuVal = "";
-  netLastMemVal = "";
-  netSysLabelsDrawn = false;
-  netQHead = 0;
-  netQCount = 0;
-  netSeq = -1;
-}
-
-// Adaptive full scale: the window's peak always lands at ~87% of the chart
-// height, so the undulation stays visible no matter the absolute speed.
-// (The old 1/2/5 stepped scale could squash everything to under half height.)
-long adaptiveNetScale(long maxV) {
-  long s = maxV + maxV / 7; // ~1.15x headroom above the peak
-  return s > 10240 ? s : 10240;
-}
-
-// Static chrome: labels that never change while in net mode.
-void drawNetChrome() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(0x7BEF, TFT_BLACK);
-  tft.drawString("DOWN", 14, 10, 1);
-  tft.drawString("UP", 134, 10, 1);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("MAC NET  -  56s", SCREEN_CX, 226, 1); // below the CPU/MEM row
-}
-
-// Mac CPU / memory usage row between the chart and the footer: small grey
-// labels at fixed positions, big font-4 values left-aligned at fixed x so a
-// width change (5% -> 30%) never shifts the rest of the row around.
-// Hidden only if an old bridge doesn't send the fields yet.
-const int NET_SYS_Y = 192;                          // row top (26px tall, font 4)
-const int NET_CPU_LABEL_X = 28, NET_CPU_VAL_X = 62; // value region 62..126 ("100%" = 63px)
-const int NET_MEM_LABEL_X = 130, NET_MEM_VAL_X = 164;
-
-void drawNetSysinfoIfChanged() {
-  if (netCpuPct < 0) {
-    if (netSysLabelsDrawn) { // bridge stopped sending: erase the whole row
-      tft.fillRect(0, NET_SYS_Y, SCREEN_W, 26, TFT_BLACK);
-      netSysLabelsDrawn = false;
-      netLastCpuVal = "";
-      netLastMemVal = "";
-    }
-    return;
-  }
-  tft.setTextDatum(TL_DATUM);
-  if (!netSysLabelsDrawn) {
-    netSysLabelsDrawn = true;
-    tft.setTextColor(0x7BEF, TFT_BLACK);
-    tft.drawString("CPU", NET_CPU_LABEL_X, NET_SYS_Y + 6, 2);
-    tft.drawString("MEM", NET_MEM_LABEL_X, NET_SYS_Y + 6, 2);
-  }
-  String c = String(netCpuPct) + "%", m = String(netMemPct) + "%";
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  if (c != netLastCpuVal) {
-    netLastCpuVal = c;
-    tft.fillRect(NET_CPU_VAL_X, NET_SYS_Y, 64, 26, TFT_BLACK);
-    tft.drawString(c, NET_CPU_VAL_X, NET_SYS_Y, 4);
-  }
-  if (m != netLastMemVal) {
-    netLastMemVal = m;
-    tft.fillRect(NET_MEM_VAL_X, NET_SYS_Y, 64, 26, TFT_BLACK);
-    tft.drawString(m, NET_MEM_VAL_X, NET_SYS_Y, 4);
-  }
-}
-
-// Header readouts (1s-averaged), each repainted only when its text changes.
-void drawNetHeaderIfChanged() {
-  String dl = speedText(netCurRx) + "/s";
-  String ul = speedText(netCurTx) + "/s";
-  tft.setTextDatum(TL_DATUM);
-  if (dl != netLastDl) {
-    netLastDl = dl;
-    tft.fillRect(12, 20, 116, 28, TFT_BLACK);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString(dl, 12, 20, 4);
-  }
-  if (ul != netLastUl) {
-    netLastUl = ul;
-    tft.fillRect(132, 20, 108, 28, TFT_BLACK);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(ul, 132, 20, 4);
-  }
-}
-
-// Repaints the whole chart region from the sample ring, one row at a time
-// through rowBuf (a single pushImage per row = no clear-then-draw flicker).
-// Download is a dim-green filled area with a bright top edge; upload is a
-// 2px yellow line on top; faint gridlines at 25/50/75%.
-void drawNetChart() {
-  static const uint16_t COL_GRID = swap565(0x2104);   // very dark grey
-  static const uint16_t COL_FILL = swap565(0x02A0);   // dim green
-  static const uint16_t COL_EDGE = swap565(TFT_GREEN);
-  static const uint16_t COL_UL = swap565(TFT_YELLOW);
-  static const uint16_t COL_BLACK = swap565(TFT_BLACK);
-
-  long maxV = 0;
-  for (int i = 0; i < NET_CHART_W; i++) {
-    if (netHistRx[i] > maxV) maxV = netHistRx[i];
-    if (netHistTx[i] > maxV) maxV = netHistTx[i];
-  }
-  netScale = adaptiveNetScale(maxV);
-
-  // Per-column heights (3-tap smoothed), then per-column line "bands": each
-  // band spans from the previous column's height to this one's, so steep
-  // rises/falls render as connected vertical strokes instead of detached
-  // stair-step dots — that's what makes the undulation read as a continuous
-  // line, like the Mac mirror's stroked polyline.
-  static uint8_t hRx[NET_CHART_W], hTx[NET_CHART_W];
-  static uint8_t dlLo[NET_CHART_W], dlHi[NET_CHART_W]; // DL edge band, incl. 3px weight
-  static uint8_t ulLo[NET_CHART_W], ulHi[NET_CHART_W]; // UL line band
-  // The panel is physically tiny (2.7cm across), so the stroke must be much
-  // thicker than the Mac mirror's to read at the same visual weight.
-  const int LINE_T = 10; // stroke thickness in px
-  for (int i = 0; i < NET_CHART_W; i++) {
-    int lo = i > 0 ? i - 1 : 0, hi = i < NET_CHART_W - 1 ? i + 1 : NET_CHART_W - 1;
-    long rx = (netHistRx[lo] + netHistRx[i] + netHistRx[hi]) / 3;
-    long tx = (netHistTx[lo] + netHistTx[i] + netHistTx[hi]) / 3;
-    int hr = (int)((float)rx / netScale * (NET_CHART_H - 2));
-    int ht = (int)((float)tx / netScale * (NET_CHART_H - 2));
-    hRx[i] = (uint8_t)constrain(hr, 0, NET_CHART_H - 1);
-    hTx[i] = (uint8_t)constrain(ht, 0, NET_CHART_H - 1);
-  }
-  for (int i = 0; i < NET_CHART_W; i++) {
-    int prevR = i > 0 ? hRx[i - 1] : hRx[0];
-    int prevT = i > 0 ? hTx[i - 1] : hTx[0];
-    dlHi[i] = (uint8_t)max((int)hRx[i], prevR);
-    dlLo[i] = (uint8_t)max(0, min((int)hRx[i], prevR) - (LINE_T - 1));
-    ulHi[i] = (uint8_t)max((int)hTx[i], prevT);
-    ulLo[i] = (uint8_t)max(0, min((int)hTx[i], prevT) - (LINE_T - 1));
-  }
-
-  for (int row = 0; row < NET_CHART_H; row++) {
-    int yFromBot = NET_CHART_H - 1 - row;
-    bool gridRow = (row == NET_CHART_H / 4 || row == NET_CHART_H / 2 || row == 3 * NET_CHART_H / 4);
-    for (int i = 0; i < NET_CHART_W; i++) {
-      uint16_t c = gridRow ? COL_GRID : COL_BLACK;
-      if (yFromBot <= dlHi[i] && yFromBot >= dlLo[i]) c = COL_EDGE;
-      else if (yFromBot < dlLo[i]) c = COL_FILL;
-      if (ulHi[i] > 0 && yFromBot <= ulHi[i] && yFromBot >= ulLo[i]) c = COL_UL;
-      rowBuf[i] = c;
-    }
-    tft.pushImage(NET_CHART_X, NET_CHART_Y + row, NET_CHART_W, 1, rowBuf);
-    if ((row & 31) == 31) yield();
-  }
-
-  // axis label (outside the chart, so it never gets repainted over)
-  String scaleText = speedText(netScale);
-  if (scaleText != netLastScaleText) {
-    netLastScaleText = scaleText;
-    tft.fillRect(120, 48, 112, 10, TFT_BLACK);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(0x7BEF, TFT_BLACK);
-    tft.drawString(scaleText, NET_CHART_X + NET_CHART_W, 48, 1);
-    tft.setTextDatum(TL_DATUM);
-  }
-}
-
-// Chart tick, every NET_DRAW_INTERVAL_MS: shift in queued sample(s), then
-// one atomic repaint. If the queue backs up after a slow poll, it works off
-// up to three samples per tick until it's back in step.
-void netDrawTick() {
-  if (!netChromeDrawn) {
-    resetNetChart();
-    drawNetChrome();
-    netChromeDrawn = true;
-    netHeaderDirty = true;
-  }
-  if (netHeaderDirty) {
-    drawNetHeaderIfChanged();
-    drawNetSysinfoIfChanged();
-    netHeaderDirty = false;
-  }
-  if (netQCount == 0) return;
-  int steps = min(netQCount, netQCount > 16 ? 3 : 1);
-  while (steps-- > 0 && netQCount > 0) {
-    memmove(netHistRx, netHistRx + 1, sizeof(long) * (NET_CHART_W - 1));
-    memmove(netHistTx, netHistTx + 1, sizeof(long) * (NET_CHART_W - 1));
-    netHistRx[NET_CHART_W - 1] = netQRx[netQHead];
-    netHistTx[NET_CHART_W - 1] = netQTx[netQHead];
-    netQHead = (netQHead + 1) % NET_QUEUE;
-    netQCount--;
-  }
-  drawNetChart();
-}
-
-// Ingests one /net payload (from HTTP polling or a serial #NET frame) into
-// the sample queue. The seq field tells us which samples we've already
-// queued, so overlapping tails are fine.
-bool handleNetPayload(const String &payload) {
-  JsonDocument doc;
-  if (deserializeJson(doc, payload)) return false;
-  netCurRx = doc["rx_bps"] | 0L;
-  netCurTx = doc["tx_bps"] | 0L;
-  netCpuPct = doc["cpu_pct"] | -1;
-  netMemPct = doc["mem_pct"] | -1;
-  netHeaderDirty = true;
-  long seq = doc["seq"] | -1L;
-  JsonArray rx = doc["rx"], tx = doc["tx"];
-  int n = min(rx.size(), tx.size());
-  // how many of the tail samples are new to us
-  int fresh = (netSeq < 0) ? min(n, 8) : (int)min((long)n, seq - netSeq);
-  if (fresh < 0) fresh = 0;
-  for (int i = n - fresh; i < n; i++) {
-    if (netQCount >= NET_QUEUE) break; // queue full: drop the excess
-    int tail = (netQHead + netQCount) % NET_QUEUE;
-    netQRx[tail] = rx[i].as<long>();
-    netQTx[tail] = tx[i].as<long>();
-    netQCount++;
-  }
-  if (seq >= 0) netSeq = seq;
-  return true;
-}
-
-// Refills the sample queue from the bridge's /net endpoint.
-void pollNet() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + bridgeHost + "/net";
-  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
-  int code = http.GET();
-  if (code == HTTP_CODE_OK) handleNetPayload(http.getString());
-  http.end();
 }
 
 // ---------- stock watchlist screen ----------
@@ -1168,8 +970,8 @@ bool handleStockPayload(const String &payload) {
   return true;
 }
 
-// Streams the Mac-rendered name strips and blits one per row (top line,
-// right of the ASCII code). Wired-only mode has no HTTP: codes still show.
+// Streams bridge-rendered name strips over HTTP and blits one per row (top
+// line, right of the ASCII code). USB mode receives the same rows over serial.
 bool drawStockNames() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
@@ -1282,12 +1084,13 @@ void drawStockScreen() {
     }
   }
 
-  // CJK name strips, re-fetched when the watchlist (names_rev) changes
+  // CJK name strips, re-fetched when the watchlist (names_rev) changes.
   if (stockNamesRev >= 0 && stockNamesDrawnRev != stockNamesRev) {
-    // HTTP first (one shot, ~15KB); the serial route is the fallback for a
-    // device with no WiFi - or one whose bridge is unreachable over the LAN.
-    if (drawStockNames()) stockNamesDrawnRev = stockNamesRev;
-    else requestNamesOverSerial(stockNamesRev);
+    // While USB is active, the bridge is already pushing quotes over serial.
+    // A failed HTTP request can block loop() for 3s, overflowing the 2048B
+    // UART buffer while name rows arrive and forcing the whole strip to retry.
+    if (wiredActive()) requestNamesOverSerial(stockNamesRev);
+    else if (drawStockNames()) stockNamesDrawnRev = stockNamesRev;
   }
 }
 
@@ -1337,6 +1140,18 @@ bool parseStatusJson(const String &payload) {
   DeserializationError err = deserializeJson(doc, payload);
   if (err) return false;
 
+  // The host already sends Unix seconds over both HTTP and USB. Anchor it to
+  // millis() so market boundaries still change between 5-second status polls.
+  long ts = doc["ts"] | 0L;
+  if (ts >= 1577836800L) { // reject absent/invalid timestamps (before 2020)
+    bridgeEpoch = (unsigned long)ts;
+    bridgeEpochAtMs = millis();
+    if (doc["cn_trading_day"].is<bool>()) {
+      tradingDayFlag = doc["cn_trading_day"].as<bool>() ? 1 : 0;
+      tradingDayIndex = ((unsigned long)ts + 8UL * 3600UL) / 86400UL;
+    }
+  }
+
   // Optional for backwards compatibility with older bridge clients. Unlike
   // brightness this is deliberately transient and is never written to flash.
   if (doc["screen_on"].is<bool>()) {
@@ -1369,8 +1184,31 @@ bool parseStatusJson(const String &payload) {
   return true;
 }
 
+bool mainlandMarketOpen() {
+  if (bridgeEpoch == 0) return false;
+  unsigned long chinaSeconds = bridgeEpoch + (millis() - bridgeEpochAtMs) / 1000UL + 8UL * 3600UL;
+  unsigned long days = chinaSeconds / 86400UL;
+  if (tradingDayFlag >= 0 && days == tradingDayIndex) {
+    if (tradingDayFlag == 0) return false; // weekend or exchange holiday
+  } else {
+    int weekday = (days + 4) % 7; // Unix epoch was Thursday; 0 = Sunday
+    if (weekday == 0 || weekday == 6) return false;
+  }
+  int minute = (chinaSeconds % 86400UL) / 60UL;
+  return (minute >= 9 * 60 + 30 && minute < 11 * 60 + 30) ||
+         (minute >= 13 * 60 && minute < 15 * 60);
+}
+
 DisplayMode effectiveMode() {
-  return displayMode;
+  if (displayMode != MODE_AUTO) return displayMode;
+  unsigned long now = millis();
+  bool claudeWorking = debouncedWorking(claudeWork, claudeStatus.status == "working", now);
+  bool codexWorking = debouncedWorking(codexWork, codexStatus.status == "working", now);
+  bool idle = !claudeWorking && !codexWorking &&
+              !claudeStatus.needsInput && !codexStatus.needsInput;
+  if (idle && mainlandMarketOpen()) return MODE_STOCK;
+  if (idle && upTurn) return MODE_UP;
+  return MODE_AUTO;
 }
 
 void pollBridge() {
@@ -1407,7 +1245,7 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_STOCK) {
+  if (eff != MODE_STOCK && eff != MODE_UP && eff == lastEffectiveMode) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
     if (updateActiveApp()) drawActiveApp();
@@ -1419,8 +1257,8 @@ void pollBridge() {
 // Fallback for WiFi networks with client isolation (device can't reach the
 // bridge over LAN) - or for skipping WiFi setup entirely: when the clock is
 // plugged into the computer over USB, the bridge pushes the same /status and
-// /net payloads down the CH340 serial line as newline-terminated frames:
-//   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
+// /stock payloads down the CH340 serial line as newline-terminated frames:
+//   bridge -> device:  #HELLO   #STATUS {json}   #STOCK {json}   #UP {json}   #CMD {json}
 //                      #NAMES <rev> <count>   #NAMEROW <rev> <strip> <row> <b64>
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}   #WANTNAMES <rev>
 // Everything else the device prints (logs) is ignored by the bridge.
@@ -1464,8 +1302,11 @@ void showMainUiIfNeeded() {
   if (mainUiShown) return;
   mainUiShown = true;
   drawStaticChrome();
-  updateActiveApp();
-  drawActiveApp();
+  DisplayMode eff = effectiveMode();
+  if (eff != MODE_STOCK && eff != MODE_UP) {
+    updateActiveApp();
+    drawActiveApp();
+  }
 }
 
 // Minimal base64 decoder. Returns bytes written, or 0 if the input is
@@ -1494,6 +1335,8 @@ size_t base64Decode(const char *src, uint8_t *out, size_t outMax) {
   }
   return n;
 }
+
+#include "up_screen.h"
 
 // Rate-limited: drawStockScreen() runs on every repaint, and the transfer takes
 // a few seconds, so without this the device would spam requests the whole time.
@@ -1539,6 +1382,7 @@ void handleNameRow(const char *args) {
   for (int i = 0; i < expect; i++)
     if (nameRowsSeen[i] != full) return;
   stockNamesDrawnRev = nameXferRev;   // whole set landed
+  Serial.printf("#NAMESOK %d\n", nameXferRev);
 }
 
 void handleSerialFrame(char *line) {
@@ -1558,15 +1402,11 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_STOCK) {
+      if (eff != MODE_STOCK && eff != MODE_UP && eff == lastEffectiveMode) {
         if (updateActiveApp()) drawActiveApp();
         else refreshActiveApp();
       }
     }
-    return;
-  }
-  if (!strncmp(line, "#NET ", 5)) {
-    handleNetPayload(String(line + 5));
     return;
   }
   if (!strncmp(line, "#STOCK ", 7)) {
@@ -1575,6 +1415,14 @@ void handleSerialFrame(char *line) {
   }
   if (!strncmp(line, "#NAMES ", 7)) {
     handleNamesHeader(line + 7);
+    return;
+  }
+  if (!strncmp(line, "#UP ", 4)) { handleUpPayload(String(line + 4)); return; }
+  if (!strncmp(line, "#UPBEGIN ", 9)) { beginUpTransfer(atoi(line + 9)); return; }
+  if (!strncmp(line, "#UPROW ", 7)) { handleUpRow(line + 7); return; }
+  if (!strncmp(line, "#UPEND ", 7)) {
+    int rev = atoi(line + 7);
+    if (endUpTransfer(rev)) Serial.printf("#UPOK %d\n", rev);
     return;
   }
   if (!strncmp(line, "#NAMEROW ", 9)) {
@@ -1598,8 +1446,8 @@ void handleSerialFrame(char *line) {
       if (m == "auto") displayMode = MODE_AUTO;
       else if (m == "claude") displayMode = MODE_CLAUDE;
       else if (m == "codex") displayMode = MODE_CODEX;
-      else if (m == "net") displayMode = MODE_NET;
       else if (m == "stock") displayMode = MODE_STOCK;
+      else if (m == "up") displayMode = MODE_UP;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
     return;
@@ -1720,8 +1568,8 @@ void handleSave() {
 const char *displayModeName(DisplayMode m) {
   if (m == MODE_CLAUDE) return "claude";
   if (m == MODE_CODEX) return "codex";
-  if (m == MODE_NET) return "net";
   if (m == MODE_STOCK) return "stock";
+  if (m == MODE_UP) return "up";
   return "auto";
 }
 
@@ -1738,22 +1586,25 @@ void handleApiDisplay() {
   if (mode == "auto") displayMode = MODE_AUTO;
   else if (mode == "claude") displayMode = MODE_CLAUDE;
   else if (mode == "codex") displayMode = MODE_CODEX;
-  else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "stock") displayMode = MODE_STOCK;
+  else if (mode == "up") displayMode = MODE_UP;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|stock");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|stock|up");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
-  if (displayMode == MODE_NET) {
-    netChromeDrawn = false;
-    lastNetPollMs = 0; // poll + draw on the next loop tick
-  } else if (displayMode == MODE_STOCK) {
+  if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
+  } else if (displayMode == MODE_UP) {
+    upChromeDrawn = false;
+    lastUpPollMs = 0;
   } else {
-    updateActiveApp();
-    drawActiveApp(); // unconditional: also repaints over a previous net chart
+    DisplayMode eff = effectiveMode();
+    if (eff != MODE_STOCK && eff != MODE_UP) {
+      updateActiveApp();
+      drawActiveApp(); // repaint the assistant page on mode change
+    }
   }
   webServer.send(200, "text/plain", "ok");
 }
@@ -2165,29 +2016,28 @@ void loop() {
   DisplayMode eff = effectiveMode();
   if (eff != lastEffectiveMode) {
     lastEffectiveMode = eff;
-    if (eff == MODE_NET) {
-      netChromeDrawn = false;
-      lastNetPollMs = 0;
-    } else if (eff == MODE_STOCK) {
+    if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
+    } else if (eff == MODE_UP) {
+      upChromeDrawn = false;
+      lastUpPollMs = 0;
     } else {
       updateActiveApp();
       drawActiveApp();
     }
   }
 
-  if (eff == MODE_NET) {
-    // net-speed mode: rendering (constant-rate sweep) is independent of the
-    // bridge polls that refill its sample queue
-    if (nowMs - lastNetDrawMs >= NET_DRAW_INTERVAL_MS) {
-      lastNetDrawMs = nowMs;
-      netDrawTick();
+  if (eff == MODE_UP) {
+    if (nowMs - lastUpPollMs >= UP_POLL_INTERVAL_MS) {
+      lastUpPollMs = nowMs;
+      if (!wiredActive()) pollUp();
     }
-    if (nowMs - lastNetPollMs >= NET_POLL_INTERVAL_MS) {
-      lastNetPollMs = nowMs;
-      if (!wiredActive()) pollNet();
-    }
+    if (wiredActive()) requestUpOverSerial();
+    drawUpScreen();
+    // In auto mode this is the UP rotation slot: keep stepping the rotation so
+    // it hands back to Claude (the transition above repaints the pet).
+    if (displayMode == MODE_AUTO) updateActiveApp();
   } else if (eff == MODE_STOCK) {
     // stock watchlist: HTTP poll unless the serial link is pushing #STOCK
     if (nowMs - lastStockPollMs >= STOCK_POLL_INTERVAL_MS) {
@@ -2237,6 +2087,12 @@ void loop() {
     if (updateActiveApp()) {
       drawActiveApp();
     }
+
+    // The UP page joins the idle rotation in auto mode. Over USB its image
+    // arrives in row frames, so fetch it in the background (cached in
+    // LittleFS, only when the revision changed) - the slot then opens on the
+    // picture instead of "Waiting for bridge...". WiFi fetches on entry.
+    if (displayMode == MODE_AUTO && wiredActive()) requestUpOverSerial();
   }
 
   // status poll continues in every mode (feeds /api/info and the web page).

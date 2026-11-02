@@ -37,23 +37,17 @@ let port: UInt16 = 8765
 let service = StatusService()
 let usage = UsageFetcher()
 service.usage = usage
-let netMonitor = NetSpeedMonitor()
-netMonitor.start()
 let stockMonitor = StockMonitor()
 stockMonitor.start()
 
-// Wired fallback: if the clock is plugged in over USB, push status/net down
+// Wired fallback: if the clock is plugged in over USB, push status/stock down
 // the serial line (works around AP client isolation; no WiFi setup needed).
-let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonitor: stockMonitor)
+let serialLink = SerialLink(service: service, stockMonitor: stockMonitor)
 serialLink.start()
 
 let server = HTTPServer(port: port, routes: [
     "/": { service.snapshot().jsonData() },
     "/status": { service.snapshot().jsonData() },
-    "/net": {
-        let stats = SystemStatsMonitor.shared.snapshot()
-        return netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)
-    },
     "/stock": { stockMonitor.jsonData() },
 ], binaryRoutes: [
     "/stock/names.raw": { stockMonitor.namesRGB565() },
@@ -73,7 +67,7 @@ let server = HTTPServer(port: port, routes: [
 // Remember it (for auto-pairing / DHCP-change self-healing) and adopt it
 // outright when no device is configured yet.
 server.onRequest = { path, ip in
-    guard path == "/status" || path == "/net" || path == "/stock",
+    guard path == "/status" || path == "/stock",
           ip != "127.0.0.1", ip != "::1", !ip.isEmpty else { return }
     DeviceClient.devicePollAt = Date()
     DeviceClient.lastSeenIP = ip
@@ -95,7 +89,7 @@ do {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,
+let menuBar = MenuBarController(service: service, usage: usage,
                                 stockMonitor: stockMonitor, port: port)
 _ = menuBar // retain
 usage.startAutoRefresh()

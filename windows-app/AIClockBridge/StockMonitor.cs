@@ -173,8 +173,7 @@ sealed class StockMonitor
             _namesError = null;
             Log.Write($"[stock] rendered {top.Length} CJK name strips"
                       + $" ({_namesData.Length} bytes, names_rev={_namesRev});"
-                      + " the device pulls these over HTTP from /stock/names.raw"
-                      + " and needs WiFi plus a bridge host to do it");
+                      + " served over USB name frames or HTTP /stock/names.raw");
         }
     }
 

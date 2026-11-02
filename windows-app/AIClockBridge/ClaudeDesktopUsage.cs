@@ -9,11 +9,8 @@ static class ClaudeDesktopUsage
 
     /// Candidate locations of the cache, most likely first.
     ///
-    /// Every official Windows build of Claude Desktop ships as MSIX, and an MSIX
-    /// app's writes to %APPDATA%\Claude are redirected into its package
-    /// container under LocalCache\Roaming\Claude. So the package path is the
-    /// real one in practice and the plain %APPDATA% path is only a fallback for
-    /// a hypothetical non-containerised build.
+    /// Current Desktop versions store their data in Claude-Data; older MSIX
+    /// versions used the package's LocalCache\Roaming\Claude directory.
     ///
     /// The package folder is enumerated rather than hardcoded: the trailing hash
     /// in "Claude_pzs8sxrjxfjjc" is derived from the signing certificate's
@@ -26,17 +23,22 @@ static class ClaudeDesktopUsage
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (local.Length > 0)
         {
-            string[] packages;
-            try { packages = Directory.GetDirectories(Path.Combine(local, "Packages"), "*Claude*"); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-                                          or ArgumentException) { packages = Array.Empty<string>(); }
-            foreach (var package in packages)
+            foreach (var data in Directories(Path.Combine(local, "Claude-Data"), "claude_*"))
+                yield return Path.Combine(data, CacheFileName);
+            foreach (var package in Directories(Path.Combine(local, "Packages"), "*Claude*"))
                 yield return Path.Combine(package, "LocalCache", "Roaming", "Claude", CacheFileName);
         }
 
         var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         if (roaming.Length > 0)
             yield return Path.Combine(roaming, "Claude", CacheFileName);
+    }
+
+    static string[] Directories(string root, string pattern)
+    {
+        try { return Directory.GetDirectories(root, pattern); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                      or ArgumentException) { return Array.Empty<string>(); }
     }
 
     public static ProviderUsage Read()

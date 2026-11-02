@@ -28,7 +28,6 @@ A retro mini-TV with a 240×240 screen that sits on your desk showing **what Cla
 | | |
 |---|---|
 | <img src="docs/images/feature1.jpg" width="360" alt="AI status"> | **AI status & quota**<br>Pet is walking = the AI is working. A square progress ring plus large digits show your real 5-hour / weekly quota usage; when a window is used up the pet becomes a reset countdown, and the border flashes red when the AI is waiting for your approval. |
-| <img src="docs/images/feature2.jpg" width="360" alt="Network monitor"> | **Live network monitor**<br>Task-manager-style upload/download curves, 56-second rolling window, auto-scaling axis. |
 | <img src="docs/images/feature3.jpg" width="360" alt="Swappable pets"> | **Swappable pets**<br>Built-in [petdex.dev](https://petdex.dev) gallery with 3300+ open-source pets, or upload any GIF — decoded on the board itself, no reflashing needed. |
 
 ## Getting started
@@ -60,7 +59,7 @@ The bridge lives in your menu bar / tray. Windows automatically prefers the USB 
   <img src="docs/images/working.jpg" width="640" alt="In action">
 </p>
 
-Daily use is all on the tray icon: **left-click** opens a live mirror of the device screen (with a brightness slider at the bottom), **right-click** opens the full menu (quota details, screen switching, pet swapping, network/stock pages, and more).
+Daily use is all on the tray icon: **left-click** opens a live mirror of the device screen (with a brightness slider at the bottom), **right-click** opens the full menu (quota details, screen switching, pet swapping, stock pages, and more). The Windows client also includes a configurable Bilibili creator page.
 
 ## FAQ
 

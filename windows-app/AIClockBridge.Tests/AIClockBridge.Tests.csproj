@@ -5,8 +5,15 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../AIClockBridge/BilibiliData.cs" Link="BilibiliData.cs" />
+    <Compile Include="../AIClockBridge/BilibiliSession.cs" Link="BilibiliSession.cs" />
+    <Compile Include="../AIClockBridge/BilibiliMonitor.cs" Link="BilibiliMonitor.cs" />
+    <Compile Include="../AIClockBridge/BilibiliScreen.cs" Link="BilibiliScreen.cs" />
+    <Compile Include="../AIClockBridge/UpScreenFrames.cs" Link="UpScreenFrames.cs" />
+    <Compile Include="../AIClockBridge/Rgb565.cs" Link="Rgb565.cs" />
     <Compile Include="../AIClockBridge/AutoStart.cs" Link="AutoStart.cs" />
     <Compile Include="../AIClockBridge/StockNameFrames.cs" Link="StockNameFrames.cs" />
     <Compile Include="../AIClockBridge/Log.cs" Link="Log.cs" />
@@ -16,6 +23,7 @@
     <Compile Include="../AIClockBridge/ClaudeHooks.cs" Link="ClaudeHooks.cs" />
     <Compile Include="../AIClockBridge/UsageFetcher.cs" Link="UsageFetcher.cs" />
     <Compile Include="../AIClockBridge/StatusService.cs" Link="StatusService.cs" />
+    <Compile Include="../AIClockBridge/ChinaMarketCalendar.cs" Link="ChinaMarketCalendar.cs" />
     <Compile Include="../AIClockBridge/Settings.cs" Link="Settings.cs" />
   </ItemGroup>
 </Project>

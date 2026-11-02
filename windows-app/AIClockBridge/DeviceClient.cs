@@ -15,10 +15,11 @@ class DeviceInfo
     public string Ip = "";
     public string Ssid = "";
     public string Bridge = "";
-    public string Mode = "auto";       // configured: auto | claude | codex | net | stock
+    public string Mode = "auto";       // configured: auto | claude | codex | stock | up
     public string Effective = "auto";
     public string Showing = "";
     public string Firmware = "";
+    public bool SupportsUp => !Version.TryParse(Firmware, out var version) || version >= new Version(0, 4, 17);
     public string Transport = "WiFi";
     public int LastUpdateS = -1;       // seconds since the device last got /status data, -1 = never
     public int SpriteRev;              // bumped by the device on animation change
@@ -145,11 +146,13 @@ static class DeviceClient
     }
 
     /// Set display mode over USB when available, otherwise POST /api/display.
-    public static Task SetDisplayMode(string mode)
+    public static async Task SetDisplayMode(string mode)
     {
+        if (mode == "up" && !(await FetchInfo()).SupportsUp)
+            throw new DeviceException("UP主页面需要设备固件 0.4.17 或更新版本。客户端左键仍可预览。");
         if (Serial?.TrySendCommand(new() { ["display"] = mode }) == true)
-            return Task.CompletedTask;
-        return PostForm("api/display", new() { ["mode"] = mode });
+            return;
+        await PostForm("api/display", new() { ["mode"] = mode });
     }
 
     /// POST /api/bridge  host=ip:port

@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using AIClockBridge;
 
+Log.ConsoleOnly = true;
 var checks = 0;
 void Check(bool condition, string description)
 {
@@ -49,6 +50,10 @@ Check(cachePaths.Length >= 1
     "every candidate path names the cache file");
 Check(cachePaths.Any(p => !p.Contains(@"\Packages\", StringComparison.Ordinal)),
     "non-MSIX fallback path still offered");
+var dataRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude-Data");
+if (Directory.Exists(dataRoot))
+    Check(cachePaths.Any(p => p.Contains(@"\Claude-Data\", StringComparison.OrdinalIgnoreCase)),
+        "current Claude-Data cache is discovered");
 
 var settings = JsonNode.Parse("""{"env":{"CUSTOM":"kept"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"existing"}]}]}}""")!.AsObject();
 ClaudeHooks.Merge(settings, "test-hook");
@@ -57,6 +62,30 @@ ClaudeHooks.Merge(settings, "test-hook");
 Check(settings.ToJsonString() == once, "hook installation idempotent");
 Check(settings["env"]["CUSTOM"].ToString() == "kept" && settings["hooks"]["Stop"].AsArray().Count == 2,
     "existing settings/hooks preserved");
+
+// Startup script refresh, on throwaway files only.
+var hookDir = Directory.CreateTempSubdirectory("aiclock-hooks-").FullName;
+try
+{
+    var scriptPath = Path.Combine(hookDir, "claude-status-hook.ps1");
+    var settingsPath = Path.Combine(hookDir, "settings.json");
+    var registered = new JsonObject();
+    ClaudeHooks.Merge(registered, ClaudeHooks.Command(scriptPath));
+    File.WriteAllText(settingsPath, registered.ToJsonString());
+
+    Check(ClaudeHooks.RefreshScript(scriptPath, settingsPath) == null && !File.Exists(scriptPath),
+        "hook refresh never creates a script that was not installed");
+    File.WriteAllText(scriptPath, "old script");
+    Check(ClaudeHooks.RefreshScript(scriptPath, settingsPath)?.StartsWith("updated") == true
+          && File.ReadAllText(scriptPath) == ClaudeHooks.Script, "outdated registered script is rewritten");
+    Check(ClaudeHooks.RefreshScript(scriptPath, settingsPath) == null, "current script is left alone");
+    File.WriteAllText(scriptPath, "old script");
+    File.WriteAllText(settingsPath, """{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other"}]}]}}""");
+    Check(ClaudeHooks.RefreshScript(scriptPath, settingsPath) == null
+          && File.ReadAllText(scriptPath) == "old script", "unregistered script is not touched");
+    Check(Directory.GetFiles(hookDir, "*.tmp").Length == 0, "hook refresh leaves no temp files");
+}
+finally { Directory.Delete(hookDir, true); }
 
 // No user log/config/network access: use absent test paths and skip auto-refresh.
 var absent = Path.Combine(Path.GetTempPath(), "aiclock-test-" + Guid.NewGuid());
@@ -80,6 +109,29 @@ service.RecordEvent("claude", "SessionEnd", sessionId: "b");
 Check(service.Snapshot().Claude.Status == "offline", "all sessions ended");
 service.RecordEvent("codex", "PreToolUse");
 Check(service.Snapshot().Codex.Status == "working", "legacy hooks remain supported");
+
+// A completed transcript corrects a lost Stop, even if metadata touches the file.
+var transcriptDir = Path.Combine(Path.GetTempPath(), "aiclock-status-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(transcriptDir);
+try
+{
+    var completed = new StatusService(transcriptDir, absent);
+    completed.RecordEvent("claude", "PreToolUse", sessionId: "completed");
+    Thread.Sleep(10);
+    var record = JsonSerializer.Serialize(new { type = "assistant", sessionId = "completed",
+        timestamp = DateTimeOffset.UtcNow.ToString("o"), message = new { stop_reason = "end_turn" } });
+    File.WriteAllText(Path.Combine(transcriptDir, "session.jsonl"), record + "\n"
+        + "{\"type\":\"metadata\"}\n");
+    Check(completed.Snapshot().Claude.Status == "idle", "end_turn corrects lost Stop despite fresh mtime");
+    completed.RecordEvent("claude", "UserPromptSubmit", sessionId: "other");
+    Check(completed.Snapshot().Claude.Status == "working", "completed transcript cannot stop another active session");
+    completed.RecordEvent("claude", "Stop", sessionId: "other");
+    Check(completed.Snapshot().Claude.Status == "idle", "all idle sessions suppress recent log mtime");
+    completed.RecordEvent("claude", "UserPromptSubmit", sessionId: "other");
+    completed.RecordEvent("claude", "Notification", "idle_prompt", "other");
+    Check(completed.Snapshot().Claude.Status == "idle", "native idle notification ends a missing Stop");
+}
+finally { Directory.Delete(transcriptDir, true); }
 
 // Bypass constructor to avoid loading real persisted settings in this unit test.
 var fetcher = (UsageFetcher)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(UsageFetcher));
@@ -207,6 +259,21 @@ Check(UsageFetcher.ChooseClaude(null, null, didNetwork: false, apiTrusted: false
     "no sources at all yields nothing");
 Check(UsageFetcher.HasNumbers(live) && !UsageFetcher.HasNumbers(apiErr)
       && !UsageFetcher.HasNumbers(null), "a reading counts only when it carries a percentage");
+
+// Credential notice: only while the user is actually left without a quota.
+const string authErr = "Claude refresh token 已过期，请运行 claude auth login";
+var staleCache = new ProviderUsage { PrimaryPct = 50, DesktopCache = true, FetchedAt = now.AddHours(-2) };
+Check(!UsageFetcher.ClaudeAuthNoticeDue(null, apiErr, now, null), "no auth error, no notice");
+Check(!UsageFetcher.ClaudeAuthNoticeDue(authErr, cached, now, null),
+    "a fresh Desktop cache still covers the quota, so a dead CLI login is not nagged");
+Check(UsageFetcher.ClaudeAuthNoticeDue(authErr, staleCache, now, null),
+    "dead login plus stale Desktop cache notifies");
+Check(UsageFetcher.ClaudeAuthNoticeDue(authErr, Api(null, authErr), now, null),
+    "dead login with no Desktop cache at all notifies");
+Check(!UsageFetcher.ClaudeAuthNoticeDue(authErr, staleCache, now, now.AddHours(-23)),
+    "notice is not repeated within a day");
+Check(UsageFetcher.ClaudeAuthNoticeDue(authErr, staleCache, now, now.AddHours(-24)),
+    "a persisting failure is re-announced daily");
 TimeSpan Span(string name) => (TimeSpan)typeof(UsageFetcher)
     .GetField(name, BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
 Check(Span("ApiTrustWindow") > Span("NetworkFetchInterval"),
@@ -254,7 +321,44 @@ var masked = UsageFetcher.ChooseClaude(
 Check(masked is { RateLimited: false },
     "the cache stand-in carries no rate-limit flag, so the raw result is what the gate needs");
 
+// A-share trading days: the bridge owns the holiday table; the firmware owns
+// the intraday windows. Dates from the 2026 SSE/SZSE closure notice.
+bool Trading(int y, int m, int d) => ChinaMarketCalendar.IsTradingDay(new DateOnly(y, m, d));
+Check(Trading(2026, 10, 9), "2026-10-09 Fri is a trading day");
+Check(!Trading(2026, 10, 1) && !Trading(2026, 10, 2) && !Trading(2026, 10, 5)
+      && !Trading(2026, 10, 6) && !Trading(2026, 10, 7), "National Day weekdays closed");
+Check(Trading(2026, 10, 8), "reopens Thu 2026-10-08");
+Check(!Trading(2026, 10, 10), "make-up working Saturday is still closed");
+Check(!Trading(2026, 1, 1) && !Trading(2026, 1, 2) && Trading(2026, 1, 5), "New Year");
+Check(new[] { 16, 17, 18, 19, 20, 23 }.All(d => !Trading(2026, 2, d)) && Trading(2026, 2, 24),
+    "Spring Festival closes Feb 16-23, reopens Feb 24");
+Check(!Trading(2026, 4, 6) && Trading(2026, 4, 7), "Qingming");
+Check(!Trading(2026, 5, 1) && !Trading(2026, 5, 4) && !Trading(2026, 5, 5) && Trading(2026, 5, 6), "Labour Day");
+Check(!Trading(2026, 6, 19) && Trading(2026, 6, 22), "Dragon Boat");
+Check(!Trading(2026, 9, 25) && Trading(2026, 9, 28), "Mid-Autumn");
+Check(ChinaMarketCalendar.HasYear(2026) && !ChinaMarketCalendar.HasYear(2099), "table coverage reported");
+Check(Trading(2099, 1, 1) == (new DateOnly(2099, 1, 1).DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday)),
+    "uncovered year falls back to the weekday rule");
+// The date is Beijing's, not UTC's: 2026-10-07 16:30Z is already Oct 8 00:30 in Beijing.
+var oct7utcEvening = new DateTimeOffset(2026, 10, 7, 16, 30, 0, TimeSpan.Zero).ToUnixTimeSeconds();
+Check(ChinaMarketCalendar.BeijingDate(oct7utcEvening) == new DateOnly(2026, 10, 8)
+      && ChinaMarketCalendar.IsTradingDay(oct7utcEvening), "trading day uses the Beijing date");
+var snapForDay = service.Snapshot();
+snapForDay.Ts = new DateTimeOffset(2026, 10, 6, 2, 0, 0, TimeSpan.Zero).ToUnixTimeSeconds();
+using (var holidayJson = JsonDocument.Parse(snapForDay.ToJson()))
+    Check(!holidayJson.RootElement.GetProperty("cn_trading_day").GetBoolean(), "/status reports a holiday");
+snapForDay.Ts = new DateTimeOffset(2026, 10, 9, 2, 0, 0, TimeSpan.Zero).ToUnixTimeSeconds();
+using (var tradingJson = JsonDocument.Parse(snapForDay.ToJson()))
+    Check(tradingJson.RootElement.GetProperty("cn_trading_day").GetBoolean(), "/status reports a trading day");
+
+if (!args.Contains("--claude-only")) await BilibiliTests.Run(Check, args);
 Console.WriteLine($"PASS: {checks} checks");
+if (args.Contains("--claude-status"))
+{
+    var actualStatus = new StatusService().Snapshot().Claude;
+    Console.WriteLine(JsonSerializer.Serialize(new { ClaudeStatus = actualStatus.Status,
+        NeedsInput = actualStatus.NeedsInput }));
+}
 if (args.Contains("--desktop-cache"))
 {
     var actual = ClaudeDesktopUsage.Read();

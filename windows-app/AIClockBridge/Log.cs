@@ -22,12 +22,15 @@ static class Log
     static readonly string Previous = Path.Combine(Dir, "bridge.1.log");
 
     public static string Folder => Dir;
+    // Offline regression failures must not masquerade as real user traffic.
+    internal static bool ConsoleOnly { get; set; }
 
     public static void Write(string message)
     {
         var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {message}";
         // Still useful under `dotnet run`, where a console does exist.
         try { Console.Error.WriteLine(line); } catch { }
+        if (ConsoleOnly) return;
         lock (Lock)
         {
             try

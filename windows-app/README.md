@@ -3,19 +3,19 @@
 `mac-app/` 菜单栏桥接的 Windows 移植版：同一套功能、同一套设备协议（固件感知不到
 桥接跑在哪个系统上），以系统托盘图标形式常驻。
 
-功能与 Mac 版一致：
+基础功能与 Mac 版一致，Windows 版另有 UP主页面：
 
-- **左键托盘图标** → ESP8266 屏幕实时镜像（额度环 + 桌宠动画 + 网速图 + 股票页，
-  与设备渲染同一份数据），底部附 自动/Claude/Codex/网速/股票 快速切换
+- **左键托盘图标** → ESP8266 屏幕实时镜像（额度环 + 桌宠动画 + 股票页 + UP主页，
+  与设备渲染同一份数据），底部附 自动/Claude/Codex/股票/UP主 快速切换
 - **右键托盘图标** → 控制菜单：Claude/Codex 完整额度（5h/周 + 重置倒计时）、
   自动查找并配对设备、设置设备地址、屏幕显示模式、petdex 桌宠画廊、恢复默认动画、
   把本机设为设备桥接、桥接服务地址
 - **跟随 Windows 锁屏** → 锁定/睡眠时临时关闭设备背光，解锁/恢复时自动点亮；
   不改变用户亮度，掉线重连或设备重启后会从 `/status` 自动校正
-- **USB 优先、WiFi 回退**：自动识别 CH340/CP210x 串口，通过 USB 推送状态、网速和
-  股票数据；USB 拔出或链路超时后，固件自动恢复局域网 HTTP 轮询
-- 本地 HTTP 服务 `0.0.0.0:8765`：`/status`、`/net`、`/stock`、
-  `/stock/names.raw`、`POST /event`（Claude Code / Codex hooks 秒级状态推送）
+- **USB 优先、WiFi 回退**：自动识别 CH340/CP210x 串口，通过 USB 推送状态、
+  股票数据、中文名称和 UP主页面；USB 拔出或链路超时后，固件自动恢复局域网 HTTP 轮询
+- 本地 HTTP 服务 `0.0.0.0:8765`：`/status`、`/stock`、`/up`、
+  `/stock/names.raw`、`/up/screen.raw`、`POST /event`（Claude Code / Codex hooks 秒级状态推送）
 - 数据来源同 Mac 版：`%USERPROFILE%\.claude\projects` / `%USERPROFILE%\.codex\sessions`
   的 JSONL 日志 + 各自官方用量接口（凭据读
   `%USERPROFILE%\.claude\.credentials.json` 和 `%USERPROFILE%\.codex\auth.json`，
@@ -26,13 +26,76 @@
   超过 35 分钟标记过期，镜像和固件不再使用过期额度。没有桌面缓存才回退到 CLI OAuth。
   桌面额度是本地文件，**每 60 秒重读一次**，打开托盘菜单和点「刷新」也一定重读；
   走网络的额度接口（Codex、无桌面版时的 Claude OAuth）仍是 120 秒一次，不受影响
-- 网速取物理网卡（以太网/WiFi）字节计数，4Hz 采样，排除 VPN/虚拟网卡
+
+0.5.9 起移除网速功能及网卡、CPU/内存后台采样；配套固件 0.4.18 同步删除该页面。
+
+## Bilibili UP主页面
+
+左键托盘选择「UP主」；右键「设置 UP主 UID…」可输入数字 UID 或空间网址，默认
+`39627524`（食贫道）。页面按清晰分区展示头像、名称、粉丝数量、最新视频标题及
+北京时间的发布日期/时分。长标题按四行分页，每页停留一分钟，保持 20px 字号。
+页面使用与其他屏幕页一致的纯黑底。UP主标签下的「立即获取」按钮以及右键菜单中的
+「立即获取 UP主数据」可提前取数，包含粉丝数和资料；获取中会禁用按钮，结果与冷却
+时间显示在状态提示中。手动获取不等待日常计划、自动取数的 5 分钟间隔或普通失败退避；
+仅风控、验证页和服务端 Retry-After 会阻止手动重试，同一时间只运行一批取数。
+
+设备端需要固件 **0.4.17 或更新版本**。中文在电脑上绘制，镜像和设备消费同一份
+240×240 RGB565 像素。USB 使用 RLE 压缩行和完整页面回执；WiFi 使用 `/up` 元数据和
+`/up/screen.raw`（4 字节大端修订号 + 115200 字节 RGB565）。设备只缓存两页，避免
+长标题占满闪存。设备每 5 秒读取本地桥接缓存，不代表每 5 秒访问 B 站。
+
+自动取数仅首次打开或到期时访问 B 站：视频每 **60–70 分钟**，粉丝每 **6 小时**；同一批请求
+之间至少 **6 秒**。头像复用本地缓存，资料仅在新 BV 时读取。不获取播放内容。
+未登录时沿用匿名 WBI 请求；匿名视频取数遇风控时，可右键「B站登录 / 更新会话…」，
+在内置官方页面手动登录，再点击「保存登录并获取」。登录模式从同一浏览器正常投稿页的
+响应读取视频，后台刷新也使用该浏览器；名称、头像和粉丝从登录用户名片读取。
+网络路径固定，不在失败后轮换代理重试。
+
+登录窗口使用 Microsoft Edge WebView2 Runtime。会话保存在
+`%LOCALAPPDATA%\AIClockBridge\bilibili-session\session.bin`，由 Windows 当前用户 DPAPI
+加密；仅向 HTTPS Bilibili 域名发送 Cookie，头像 CDN 不发送。网页资料在
+`%LOCALAPPDATA%\AIClockBridge\bilibili-browser`。密码、Cookie 和完整响应不会写入日志。
+登录过期或页面要求验证时，重新打开登录窗口由用户操作。首次验证的新登录会话允许重新
+检查旧匿名上下文的本地退避；同一登录反复保存不会绕过风控，服务端 Retry-After 始终保留。
+
+普通故障时每组尝试一次备用：登录时视频用 Web 动态，匿名时用 desktop 动态，
+名称/头像和粉丝数用用户名片。
+名片如已读取则复用，所有字段独立保存；头像下载失败继续使用本地头像。右键菜单可看
+当前各字段来源。动态可能漏充电专属或未同步发动态的视频，备用日期取投稿动态时间；
+较旧结果不覆盖缓存中的新视频。名片的匿名访问在 2026-10-08 对当前 UID 已实测成功，
+但不保证所有环境均可匿名访问。RSSHub 公共实例此前连接失败，未作为默认备用。
+
+HTTP 412/429/403、风控业务码或验证 HTML 页面出现后立即停止，当次也不尝试备用，按 **6/12/24/48 小时**
+退避；服务端更长的 Retry-After 也会遵守。一般故障自动获取按 2/4/8/…/24 小时退避，
+但允许点击立即获取重试。旧版未区分原因的冷却只限制自动获取；0.5.12 自动解除 0.5.11
+误迁移的「旧版保存的接口冷却」对手动按钮的限制，保留资料缓存及明确的风控记录，无需删缓存。
+失败保留上次成功数据，菜单会报告错误和下一次检查时间。数据、每个 UID 的到期时间及
+全局冷却保存在 `%APPDATA%\AIClockBridge\bilibili\cache.json`；重启、反复点标签和换 UID
+都不能绕过风控冷却。不同 UID 的自动首次取数有全局 5 分钟间隔，手动获取不受此限制。
+
+这是保守的客户端策略，B 站未提供可保证不风控的公开频率。2026-09-30 的探测中直连
+签名视频接口成功，后续通过系统代理的集成试请求返回 412；测试按规定停止，没有换路径
+立即重试。当前实现固定直连，但该路径仍可能受服务器风控，不能保证长期可用。
+
+2026-10-08 对当前 UID `3546619609876957` 的同环境诊断：用户名片与粉丝统计成功，
+desktop 动态为 code=0 的空列表，签名视频列表 HTTP 412。签名摘要独立复算一致；
+不能因此认定接口已废弃，也不能保证匿名请求只补某个参数就能恢复。当前流程先获取视频，
+该步骤风控会终止整批取数，因此资料接口可用也不代表现有页面已能显示资料。
+0.5.13 增加实际失败接口提示与 code=0 风控凭据识别，仅改善诊断，未恢复匿名视频取数。
+随后 0.5.14 的正常登录复验成功：官方投稿页返回 BV1VGHD6XERR，用户名片返回名称、
+头像和粉丝 460,958；Web 动态返回 12 条。独立进程的隐藏浏览器也读取成功，支持跨重启
+使用。这里只证明本次登录环境可用，不保证后续不会要求重新登录或验证。
+
+回归测试默认全离线：`dotnet run --project windows-app/AIClockBridge.Tests`。
+加 `-- --up-preview` 可生成实际 240×240 排版图；显式加 `-- --up-live` 才执行一次真实
+低频取数，使用 `dist/research/bilibili-39627524/live-monitor` 中的独立持久化闸门，不动
+用户 UID 设置。该集成目录处于冷却时不会新增请求。
 
 与 Mac 版的差异：
 
 - 无固件刷写入口（刷写请用网页版刷写工具）
-- 唯一的第三方依赖是 [ImageSharp](https://github.com/SixLabors/ImageSharp)——
-  System.Drawing 解不了 petdex 的 WebP 精灵图、也编不了多帧 GIF
+- [ImageSharp](https://github.com/SixLabors/ImageSharp) 负责 petdex 的 WebP 精灵图及多帧 GIF；
+  [Microsoft WebView2](https://learn.microsoft.com/microsoft-edge/webview2/) 负责 B 站官方登录和投稿页。
 
 ## 构建 / 运行
 
@@ -133,15 +196,16 @@ curl.exe -s http://localhost:8765/status | python -m json.tool
 所以**这个文件是唯一的诊断来源**。
 
 **「额度/行情卡住不动」**：先看托盘。Codex 那行若带 `（缓存：…）`、股票那行若显示
-「股票：行情请求失败：…」，说明是**上游取数失败**，跟设备通讯无关。这两项是唯二需要
-公网的数据（`chatgpt.com` 和 `qt.gtimg.cn`），而 Claude 额度读本地文件、网速读本地
-计数器，所以它们仍然正常——这个组合就是判据。常见原因是代理客户端在桥接运行期间改了
+「股票：行情请求失败：…」，说明是**上游取数失败**，跟设备通讯无关。Codex、股票与
+UP主取数都访问公网，而 Claude 桌面额度可以读取本地缓存。常见原因是代理客户端在桥接运行期间改了
 系统代理；0.5.1 起 HttpClient 会在连续 3 次传输层失败后重建并重读代理设置，不必再
 重启程序。日志里搜 `[http:` 能看到重建记录和当时的代理配置。
 
 ## Claude 桌面版
 
 打开并登录 Claude 桌面版后，桥接自动读取 `plan-usage-history.json`，支持：
+
+- **新版 Claude Desktop**：枚举 `%LOCALAPPDATA%\Claude-Data\claude_*\plan-usage-history.json`
 
 - **MSIX 安装（实际就是这条）**：枚举 `%LOCALAPPDATA%\Packages\*Claude*\LocalCache\Roaming\Claude\plan-usage-history.json`
 - 兜底：`%APPDATA%\Claude\plan-usage-history.json`
@@ -177,6 +241,10 @@ publisher hash，证书轮换或改包名都会让写死的路径**静默失效*
 桥接未启动时转发最多等待 2 秒，然后正常退出。
 
 状态按会话合并：任一会话工作则显示工作中，任一会话等待审批则显示需要输入；
+会话日志中的 `end_turn` / `stop_sequence` 会校正同一会话漏收的 Stop，
+所有会话空闲时直接结束工作动画；日志文件的后台更新时间不会覆盖明确的结束记录。
+重新启用状态同步后，还会转发 `idle_prompt` 通知作为停止事件的补充。
+状态变化和收到的事件名会写入桥接日志，不记录会话正文。
 一项任务完成不会覆盖另一项任务的工作状态。无日志的桌面会话也可显示空闲。
 工作事件有效期为 10 分钟，等待输入为 5 分钟，空闲为 30 分钟；无后续事件时自动降级，
 因此超过 10 分钟没有事件的长任务可能暂时显示空闲。进程重启后等待下一次 Hook 恢复状态。
@@ -204,7 +272,6 @@ dotnet run --project windows-app/AIClockBridge.Tests -c Release -- --desktop-cac
 | `PetdexService.cs` | `PetdexService.swift` | manifest / 精灵图 / GIF 合成 |
 | `StatusService.cs` | `StatusReader.swift` | JSONL 日志扫描 + hook 事件 |
 | `UsageFetcher.cs` | `UsageFetcher.swift` | 官方额度接口 |
-| `NetSpeedMonitor.cs` | `NetSpeedMonitor.swift` | 4Hz 网速采样环 |
 | `SerialLink.cs` | `SerialLink.swift` | USB 串口发现、握手、状态推送和自动重连 |
 | `DeviceClient.cs` | `DeviceClient.swift` | 设备 HTTP API + 自动配对/子网扫描 |
 | `MiniHttpServer.cs` | `HTTPServer.swift` | 0.0.0.0:8765 极简 HTTP 服务 |

@@ -14,6 +14,10 @@ sealed class TrayAppContext : ApplicationContext
     readonly UsageFetcher _usage;
     readonly WindowsScreenPowerController _screenPower;
     readonly StockMonitor _stockMonitor;
+    readonly BilibiliMonitor _upMonitor;
+    readonly BilibiliBrowserForm _upBrowser;
+    readonly ToolStripMenuItem _upInfoItem = new("UP主：尚未获取") { Enabled = false };
+    readonly ToolStripMenuItem _upSourcesItem = new("数据来源：尚未获取") { Enabled = false };
     readonly int _port;
     readonly MirrorForm _mirror;
     readonly ContextMenuStrip _menu = new();
@@ -35,16 +39,18 @@ sealed class TrayAppContext : ApplicationContext
     /// toggle handler and rewrite the registry on every menu open.
     bool _syncingAutoStart;
 
-    public TrayAppContext(StatusService service, UsageFetcher usage, NetSpeedMonitor netMonitor,
-                          StockMonitor stockMonitor,
-                          WindowsScreenPowerController screenPower, int port)
+    public TrayAppContext(StatusService service, UsageFetcher usage,
+                          StockMonitor stockMonitor, BilibiliMonitor upMonitor,
+                          WindowsScreenPowerController screenPower, int port, BilibiliBrowserForm upBrowser = null)
     {
         _service = service;
         _usage = usage;
         _screenPower = screenPower;
         _stockMonitor = stockMonitor;
+        _upMonitor = upMonitor;
+        _upBrowser = upBrowser;
         _port = port;
-        _mirror = new MirrorForm(service, netMonitor, stockMonitor);
+        _mirror = new MirrorForm(service, stockMonitor, upMonitor);
 
         BuildMenu();
         _trayIcon = new NotifyIcon
@@ -63,10 +69,32 @@ sealed class TrayAppContext : ApplicationContext
             _usage.Refresh(userInitiated: true);
             RefreshUsageLines();
             RefreshStockError();
+            RefreshUpInfo();
             SyncAutoStartItem();
             _ = RefreshDeviceSection();
         };
-        _usage.OnUpdate = RefreshUsageLines;
+        _usage.OnUpdate = () =>
+        {
+            RefreshUsageLines();
+            NotifyClaudeAuthIfNeeded();
+        };
+    }
+
+    DateTime? _claudeAuthNoticeAt;
+
+    /// Balloon for a dead CLI login. The failure used to surface only as text in
+    /// the right-click menu, so the quota just went blank on the device for weeks.
+    void NotifyClaudeAuthIfNeeded()
+    {
+        var error = _usage.ClaudeAuthError;
+        if (error == null) { _claudeAuthNoticeAt = null; return; }   // episode over
+        var now = DateTime.UtcNow;
+        if (!UsageFetcher.ClaudeAuthNoticeDue(error, _usage.Claude, now, _claudeAuthNoticeAt)) return;
+        _claudeAuthNoticeAt = now;
+        Log.Write($"[usage] claude: 凭据失效通知已弹出（{error}）");
+        _trayIcon.ShowBalloonTip(15000, "Claude 额度暂时取不到",
+            $"{error}。\n在 Claude Code 中执行 /login（或终端 claude auth login）重新登录；"
+            + "点一下 Claude 桌面版托盘图标可临时恢复。", ToolTipIcon.Warning);
     }
 
     /// User-supplied device logo (bezel + dark screen + smiley + green status
@@ -107,8 +135,9 @@ sealed class TrayAppContext : ApplicationContext
         var displayMenu = new ToolStripMenuItem("屏幕显示");
         foreach (var (title, mode) in new[]
         {
-            ("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-            ("固定 Codex", "codex"), ("网速曲线", "net"), ("股票行情", "stock"),
+            ("自动（开盘看股票，空闲轮换 Claude/Codex/UP主）", "auto"), ("固定 Claude", "claude"),
+            ("固定 Codex", "codex"), ("股票行情", "stock"),
+            ("UP主", "up"),
         })
         {
             var item = new ToolStripMenuItem(title);
@@ -137,6 +166,25 @@ sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(_autoStartItem);
 
         _menu.Items.Add(_stockErrorItem);
+        _menu.Items.Add(_upInfoItem);
+        _menu.Items.Add(_upSourcesItem);
+        _menu.Items.Add(MakeItem("B站登录 / 更新会话…", (_, _) => _upBrowser?.OpenLogin()));
+        var upFetchItem = new ToolStripMenuItem("立即获取 UP主数据");
+        upFetchItem.Click += async (_, _) =>
+        {
+            upFetchItem.Enabled = false;
+            try { Toast("UP主", await _upMonitor.FetchNow()); RefreshUpInfo(); }
+            finally { upFetchItem.Enabled = true; }
+        };
+        _menu.Items.Add(upFetchItem);
+        _menu.Items.Add(MakeItem("设置 UP主 UID…", (_, _) =>
+        {
+            var input = InputDialog.Show("关注 UP主", "输入 Bilibili UID 或 UP 主空间地址", _upMonitor.Uid, "39627524");
+            if (input == null) return;
+            if (!_upMonitor.SetUid(input))
+                MessageBox.Show("请输入有效的数字 UID 或 https://space.bilibili.com/UID 地址。", "UP主 UID");
+            RefreshUpInfo();
+        }));
         _menu.Items.Add(MakeItem("设置自选股…", (_, _) =>
         {
             var input = InputDialog.Show(
@@ -261,10 +309,8 @@ sealed class TrayAppContext : ApplicationContext
 
     // MARK: - refresh
 
-    /// The stock page's Chinese names are RGB565 strips the device pulls from
-    /// our /stock/names.raw over HTTP - prices arrive over the serial link and
-    /// are unaffected. So "prices move, names never show" means WiFi or the
-    /// bridge host is wrong on the device, and this line says which.
+    /// The stock page receives Chinese name strips over USB while linked, or
+    /// from /stock/names.raw over HTTP when using WiFi only.
     void ShowDeviceNetState(DeviceInfo info)
     {
         var wifi = info.Ssid.Length > 0 && info.Ip.Length > 0 && info.Ip != "0.0.0.0"
@@ -272,9 +318,9 @@ sealed class TrayAppContext : ApplicationContext
             : "未连 WiFi";
         var bridge = info.Bridge.Length > 0 ? info.Bridge : "未设置";
         var hint = "";
-        if (wifi == "未连 WiFi")
-            hint = "　← 股票中文名需要 WiFi";
-        else if (info.Bridge.Length == 0)
+        if (wifi == "未连 WiFi" && !DeviceClient.UsbConnected)
+            hint = "　← 股票中文名需要 USB 或 WiFi";
+        else if (info.Bridge.Length == 0 && !DeviceClient.UsbConnected)
             hint = "　← 点上面「把本机设为设备桥接」";
         _deviceNetItem.Text = $"　{wifi} · 桥接 {bridge}{hint}";
         _deviceNetItem.Visible = true;
@@ -282,16 +328,34 @@ sealed class TrayAppContext : ApplicationContext
 
     void RefreshStockError()
     {
+        var notes = new List<string>();
         var error = _stockMonitor?.Error;
-        if (string.IsNullOrEmpty(error))
+        if (!string.IsNullOrEmpty(error))
         {
-            _stockErrorItem.Visible = false;
-            return;
+            var at = _stockMonitor.FetchedAt;
+            var age = at.HasValue ? $"，最后成功 {at.Value.ToLocalTime():HH:mm}" : "";
+            notes.Add($"{error}{age}");
         }
-        var at = _stockMonitor.FetchedAt;
-        var age = at.HasValue ? $"，最后成功 {at.Value.ToLocalTime():HH:mm}" : "";
-        _stockErrorItem.Text = $"股票：{error}{age}";
-        _stockErrorItem.Visible = true;
+        // The holiday table needs a yearly update; without it every weekday
+        // counts as a trading day, so say so instead of failing silently.
+        var year = ChinaMarketCalendar.BeijingDate(DateTimeOffset.UtcNow.ToUnixTimeSeconds()).Year;
+        if (!ChinaMarketCalendar.HasYear(year))
+            notes.Add($"休市表未含 {year} 年，节假日按交易日处理");
+        _stockErrorItem.Visible = notes.Count > 0;
+        if (notes.Count > 0) _stockErrorItem.Text = "股票：" + string.Join("；", notes);
+    }
+
+    void RefreshUpInfo()
+    {
+        var profile = _upMonitor.Snapshot;
+        var name = string.IsNullOrEmpty(profile.Name) ? $"UID {_upMonitor.Uid}" : profile.Name;
+        var next = _upMonitor.NextRefreshAt;
+        var last = profile.VideoCheckedAt?.ToLocalTime().ToString("MM-dd HH:mm") ?? "尚未获取";
+        _upInfoItem.Text = $"UP主：{name} · {last}" +
+            (next > DateTimeOffset.UtcNow ? $" · 下次自动 {next.ToLocalTime():MM-dd HH:mm}" : " · 视频约每小时，粉丝每6小时");
+        if (_upMonitor.Error != null) _upInfoItem.Text += $" · {_upMonitor.Error}（保留缓存）";
+        _upSourcesItem.Text = _upMonitor.SourcesSummary;
+        if (!string.IsNullOrEmpty(_upMonitor.SourceWarning)) _upSourcesItem.Text += " · " + _upMonitor.SourceWarning;
     }
 
     void RefreshUsageLines()
@@ -324,7 +388,7 @@ sealed class TrayAppContext : ApplicationContext
         if (u.DesktopCache)
         {
             result += $"　（桌面缓存 · {u.FetchedAt?.ToLocalTime():MM-dd HH:mm}"
-                + (u.DesktopStale ? " · 已过期，请打开 Claude）" : "）");
+                + (u.DesktopStale ? " · 已过期，点一下 Claude 托盘图标可恢复）" : "）");
             // On a cache reading the error explains why the live source is
             // unavailable - the whole reason this line is not "凭据实时".
             return u.Error == null ? result : result + $"　（{u.Error}）";
@@ -376,8 +440,8 @@ sealed class TrayAppContext : ApplicationContext
             info.ClaudeCustomSprite ? "C:自定义" : "C:默认",
             info.CodexCustomSprite ? "X:自定义" : "X:默认",
         };
-        var showing = info.Mode == "net" ? "网速"
-            : info.Mode == "stock" ? "股票"
+        var showing = info.Effective == "stock" ? "股票"
+            : info.Effective == "up" ? "UP主"
             : (info.Showing == "claude" ? "Claude" : "Codex");
         _deviceInfoItem.Text =
             $"设备：{info.Transport} · 正在显示 {showing} · {string.Join(" ", sprites)}";
@@ -432,6 +496,7 @@ sealed class TrayAppContext : ApplicationContext
 
     async Task SetDisplayMode(string mode)
     {
+        if (mode is "up" or "auto") _ = _upMonitor.Activate();
         try
         {
             await DeviceClient.SetDisplayMode(mode);

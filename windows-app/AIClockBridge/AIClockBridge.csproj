@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <!-- Windows port of mac-app/: same tray-icon bridge (status server, screen
-       mirror, quota, net speed, stock data, petdex picker). WinForms;
+       mirror, quota, stock data, Bilibili profiles, petdex picker). WinForms;
        ImageSharp is the one third-party dep, needed because
        System.Drawing cannot decode petdex's WebP spritesheets nor author
        multi-frame GIFs. EnableWindowsTargeting lets the project compile on
@@ -31,7 +31,7 @@
        To release: bump this, add a CHANGELOG.md entry, run build-release.ps1.
        The payload folder name follows automatically. -->
   <PropertyGroup>
-    <Version>0.5.4</Version>
+    <Version>0.5.17</Version>
     <Product>AIClockBridge</Product>
     <Company>esp8266-ai</Company>
     <Description>AI Clock Bridge - tray bridge for the SD2 ESP8266 status display</Description>
@@ -40,6 +40,7 @@
   <ItemGroup>
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
     <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
   </ItemGroup>
 
   <ItemGroup>
@@ -47,5 +48,11 @@
     <EmbeddedResource Include="Assets\codex-logo.png" />
     <EmbeddedResource Include="Assets\happy-mac.png" />
   </ItemGroup>
+
+  <Target Name="RemoveUnusedWebViewWpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Reference.Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
 
 </Project>

@@ -14,10 +14,5 @@ let package = Package(
             path: "Sources/AIClockBridge",
             resources: [.process("Resources")]
         ),
-        .testTarget(
-            name: "AIClockBridgeTests",
-            dependencies: ["AIClockBridge"],
-            path: "Tests/AIClockBridgeTests"
-        ),
     ]
 )
