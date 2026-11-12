@@ -11,49 +11,29 @@ void Check(bool condition, string description)
     checks++;
 }
 var now = DateTime.UtcNow;
-var ms = new DateTimeOffset(now).ToUnixTimeMilliseconds();
-ProviderUsage Parse(string json)
+var end = now.AddDays(3).ToString("o");
+var weekly = GrokUsage.Parse(
+    "{\"config\":{\"creditUsagePercent\":42.5,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"end\":\""
+    + end + "\"}}}", now);
+Check(weekly.PrimaryPct == null && weekly.WeeklyPct == 42.5 && weekly.Period == "week",
+    "grok credit percent fills the single weekly window");
+Check(weekly.WeeklyResetMin is >= 3 * 24 * 60 - 1 and <= 3 * 24 * 60 + 1, "period end becomes reset minutes");
+var monthly = GrokUsage.Parse(
+    "{\"creditUsagePercent\":10,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_MONTHLY\",\"end\":\""
+    + end + "\"}}", now);
+Check(monthly.Period == "month" && monthly.WeeklyPct == 10, "monthly period is labeled month");
+var legacy = GrokUsage.Parse("{\"config\":{\"monthlyLimit\":{\"val\":2000},\"used\":{\"val\":500}}}", now);
+Check(legacy.WeeklyPct == 25 && legacy.Period == "week" && legacy.WeeklyResetMin == null,
+    "legacy used/limit derives a percent");
+Check(GrokUsage.Parse("not-json", now).WeeklyPct == null, "non-json billing body has no percent");
+Check(GrokUsage.Parse("{\"config\":{}}", now).Error != null, "missing percent is an error");
+var zero = GrokUsage.Parse("{\"config\":{\"creditUsagePercent\":0,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\"}}}", now);
+Check(zero.WeeklyPct == 0, "a real zero percent is kept");
+var stale = new ProviderUsage
 {
-    using var doc = JsonDocument.Parse(json);
-    return ClaudeDesktopUsage.Parse(doc.RootElement, now);
-}
-var v1 = Parse($$$"""{"version":1,"samples":[{"t":{{{ms}}},"fh":0,"sd":22}]}""");
-Check(v1.PrimaryPct == 0 && v1.WeeklyPct == 22 && !v1.DesktopStale, "v1 incl zero");
-var v2 = Parse($$$"""{"version":2,"samples":[{"t":{{{ms}}},"org":"new","u":{"fh":31}},{"t":{{{ms-1000}}},"org":"old","u":{"fh":90,"sd":99}}]}""");
-Check(v2.PrimaryPct == 31 && v2.WeeklyPct == null, "newest sample, no cross-org mixing");
-Check(v2.PrimaryResetMin == null && v2.WeeklyResetMin == null, "no fabricated reset times");
-Check(Parse("{\"version\":\"2\",\"samples\":[]}") == null, "invalid version type");
-Check(Parse("{\"version\":3,\"samples\":[]}") == null, "future version");
-Check(Parse($$$"""{"version":2,"samples":[{"t":{{{ms+600000}}},"u":{"fh":50}}]}""") == null, "future timestamp");
-var invalid = Parse($$$"""{"version":2,"samples":[null,{"t":{{{ms}}},"u":{"fh":101,"sd":-1}}]}""");
-Check(invalid.PrimaryPct == null && invalid.WeeklyPct == null, "invalid percentages");
-var stale = Parse($$$"""{"version":2,"samples":[{"t":{{{ms - 40*60*1000}}},"u":{"fh":50,"sd":25}}]}""");
-Check(stale.DesktopStale && stale.FetchedAt < now.AddMinutes(-35), "sample age preserved");
-
-// Claude Desktop appends a sample every 15.00 min (measured on a real install),
-// so the staleness threshold has to clear two of them. At the old value of 15
-// min the newest sample expired exactly when the next was written, blanking the
-// quota on the device once per cycle.
-Check(ProviderUsage.DesktopStaleAfter > ProviderUsage.DesktopSampleInterval * 2,
-    "stale threshold clears two Desktop sampling intervals");
-ProviderUsage Aged(int minutes) =>
-    Parse($$$"""{"version":2,"samples":[{"t":{{{ms - minutes*60*1000}}},"u":{"fh":50,"sd":25}}]}""");
-Check(!Aged(14).DesktopStale, "14 min old - normal mid-cycle age, still fresh");
-Check(!Aged(16).DesktopStale, "16 min old - the case that used to blank the device");
-Check(!Aged(29).DesktopStale, "one missed sample is not yet stale");
-Check(Aged(36).DesktopStale, "two missed samples means Desktop is gone");
-
-// Cache discovery must not depend on the MSIX publisher hash staying constant.
-var cachePaths = ClaudeDesktopUsage.Paths().ToArray();
-Check(cachePaths.Length >= 1
-      && cachePaths.All(p => p.EndsWith("plan-usage-history.json", StringComparison.Ordinal)),
-    "every candidate path names the cache file");
-Check(cachePaths.Any(p => !p.Contains(@"\Packages\", StringComparison.Ordinal)),
-    "non-MSIX fallback path still offered");
-var dataRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude-Data");
-if (Directory.Exists(dataRoot))
-    Check(cachePaths.Any(p => p.Contains(@"\Claude-Data\", StringComparison.OrdinalIgnoreCase)),
-        "current Claude-Data cache is discovered");
+    PrimaryPct = 50, WeeklyPct = 25, DesktopCache = true, FetchedAt = now.AddMinutes(-40),
+};
+Check(stale.DesktopStale, "a desktop-flagged reading older than the window is stale");
 
 var settings = JsonNode.Parse("""{"env":{"CUSTOM":"kept"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"existing"}]}]}}""")!.AsObject();
 ClaudeHooks.Merge(settings, "test-hook");
@@ -139,10 +119,11 @@ void Set(string field, object value) => typeof(UsageFetcher).GetField(field, Bin
 Set("_lock", new object()); Set("_claude", stale); Set("_codex", new ProviderUsage());
 service.Usage = fetcher;
 using var status = JsonDocument.Parse(service.Snapshot().ToJson());
-Check(status.RootElement.GetProperty("claude").GetProperty("five_hour_pct").ValueKind == JsonValueKind.Null,
+Check(status.RootElement.GetProperty("grok").GetProperty("five_hour_pct").ValueKind == JsonValueKind.Null,
     "expired desktop percentage withheld from firmware");
-Set("_claude", v1);
-Check(service.Snapshot().Claude.FiveHourPct == 0, "fresh zero forwarded to firmware");
+Set("_claude", zero);
+Check(service.Snapshot().Claude.SevenDayPct == 0 && service.Snapshot().Claude.FiveHourPct == null
+      && service.Snapshot().Claude.Period == "week", "fresh zero credit percent forwarded to firmware");
 
 // Poll cadences must stay split: the Desktop cache is a local file and is read
 // every minute, while network fetches keep the slower interval they had when
@@ -358,12 +339,4 @@ if (args.Contains("--claude-status"))
     var actualStatus = new StatusService().Snapshot().Claude;
     Console.WriteLine(JsonSerializer.Serialize(new { ClaudeStatus = actualStatus.Status,
         NeedsInput = actualStatus.NeedsInput }));
-}
-if (args.Contains("--desktop-cache"))
-{
-    var actual = ClaudeDesktopUsage.Read();
-    Console.WriteLine(JsonSerializer.Serialize(new { Found = actual != null,
-        PrimaryPct = actual?.PrimaryPct, WeeklyPct = actual?.WeeklyPct,
-        SampleTime = actual?.FetchedAt, Stale = actual?.DesktopStale }));
-    if (actual == null) Environment.ExitCode = 1;
 }

@@ -370,6 +370,18 @@ sealed class SerialLink : IDisposable
             lock (_stateLock) _deviceInfo = info;
             _lastDeviceAt = DateTime.UtcNow;
             DeviceClient.DevicePollAt = _lastDeviceAt;
+            // DHCP can move the clock while USB stays up. GIF upload and the
+            // other device HTTP calls use this address, not the serial link.
+            if (info.Ip.Length > 0 && info.Ip != "0.0.0.0")
+            {
+                DeviceClient.LastSeenIp = info.Ip;
+                var hostIp = DeviceClient.Host.Split(':')[0];
+                if (!string.Equals(hostIp, info.Ip, StringComparison.OrdinalIgnoreCase))
+                {
+                    DeviceClient.Host = info.Ip;
+                    Log.Write($"[serial] device address {hostIp} -> {info.Ip}");
+                }
+            }
             if (_linked) return;
             _linked = true;
             Settings.Set(PortKey, _portName);

@@ -19,7 +19,7 @@
     <Compile Include="../AIClockBridge/Log.cs" Link="Log.cs" />
     <Compile Include="../AIClockBridge/SystemProxy.cs" Link="SystemProxy.cs" />
     <Compile Include="../AIClockBridge/ResilientHttpClient.cs" Link="ResilientHttpClient.cs" />
-    <Compile Include="../AIClockBridge/ClaudeDesktopUsage.cs" Link="ClaudeDesktopUsage.cs" />
+    <Compile Include="../AIClockBridge/GrokUsage.cs" Link="GrokUsage.cs" />
     <Compile Include="../AIClockBridge/ClaudeHooks.cs" Link="ClaudeHooks.cs" />
     <Compile Include="../AIClockBridge/UsageFetcher.cs" Link="UsageFetcher.cs" />
     <Compile Include="../AIClockBridge/StatusService.cs" Link="StatusService.cs" />

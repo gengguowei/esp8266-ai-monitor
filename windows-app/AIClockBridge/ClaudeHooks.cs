@@ -10,7 +10,7 @@ static class ClaudeHooks
     internal const string Script = """
         try {
             $eventData = [Console]::In.ReadToEnd() | ConvertFrom-Json
-            $payload = @{ agent = 'claude'; event = $eventData.hook_event_name; session_id = $eventData.session_id }
+            $payload = @{ agent = 'grok'; event = $eventData.hook_event_name; session_id = $eventData.session_id }
             if ($eventData.notification_type -eq 'permission_prompt') { $payload.message = 'permission' }
             if ($eventData.notification_type -eq 'idle_prompt') { $payload.message = 'idle_prompt' }
             $json = $payload | ConvertTo-Json -Compress

@@ -3,11 +3,11 @@ using System.Text.Json;
 
 namespace AIClockBridge;
 
-// Port of the Mac StatusReader. No account APIs / keys are touched -
-// everything comes from the JSONL session logs Claude Code and Codex CLI
-// already write to disk (same paths on Windows, under %USERPROFILE%):
-//   ~/.claude/projects/**/*.jsonl   (Claude Code transcripts)
+// Working/idle comes from the JSONL session logs Grok Build and Codex CLI
+// already write to disk (under %USERPROFILE%):
+//   ~/.grok/sessions/**/*.jsonl     (Grok Build transcripts)
 //   ~/.codex/sessions/**/*.jsonl    (Codex CLI rollouts, incl. rate_limits)
+// The first slot's wire name is "grok". Firmware still accepts "claude".
 
 class ClaudeStatus
 {
@@ -19,6 +19,7 @@ class ClaudeStatus
     public int? FiveHourResetMin;
     public double? SevenDayPct;
     public int? SevenDayResetMin;
+    public string Period = "week"; // Grok credit window: "week" or "month"
     public bool NeedsInput; // waiting on a permission/approval prompt
 }
 
@@ -55,7 +56,7 @@ class StatusSnapshot
             // the auto stock page; older firmware ignores the field.
             w.WriteBoolean("cn_trading_day", ChinaMarketCalendar.IsTradingDay(Ts));
             w.WriteBoolean("screen_on", ScreenOn);
-            w.WriteStartObject("claude");
+            w.WriteStartObject("grok");
             w.WriteString("status", Claude.Status);
             w.WriteNumber("tokens_today", Claude.TokensToday);
             w.WriteNumber("session_min", Claude.SessionMin);
@@ -64,6 +65,7 @@ class StatusSnapshot
             WriteNullable(w, "five_hour_reset_min", Claude.FiveHourResetMin);
             WriteNullable(w, "seven_day_pct", Claude.SevenDayPct);
             WriteNullable(w, "seven_day_reset_min", Claude.SevenDayResetMin);
+            w.WriteString("period", Claude.Period == "month" ? "month" : "week");
             w.WriteBoolean("needs_input", Claude.NeedsInput);
             w.WriteEndObject();
             w.WriteStartObject("codex");
@@ -134,9 +136,9 @@ sealed class StatusService
     public StatusService(string claudeDir = null, string codexDir = null)
     {
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var config = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
-        _claudeDir = claudeDir ?? Path.Combine(string.IsNullOrWhiteSpace(config)
-            ? Path.Combine(profile, ".claude") : config, "projects");
+        var grokHome = Environment.GetEnvironmentVariable("GROK_HOME");
+        _claudeDir = claudeDir ?? Path.Combine(string.IsNullOrWhiteSpace(grokHome)
+            ? Path.Combine(profile, ".grok") : grokHome, "sessions");
         _codexDir = codexDir ?? Path.Combine(profile, ".codex", "sessions");
     }
 
@@ -194,6 +196,10 @@ sealed class StatusService
         lock (_lock)
         {
             var now = Now();
+            // The slot used to be Claude. Hooks and older callers may still say
+            // either name; both land on this same tracker.
+            if (agent == "grok") agent = "claude";
+            ev = CanonicalEvent(ev);
             if (agent == "claude" && ev == "Notification" && message == "idle_prompt") ev = "Stop";
             if (agent == "claude" && !string.IsNullOrWhiteSpace(sessionId))
             {
@@ -241,6 +247,24 @@ sealed class StatusService
     }
 
     static bool NeedsInput(double? at, double now) => at.HasValue && now - at.Value < NeedsInputTTL;
+
+    /// Grok posts `preToolUse`; Claude Code posts `PreToolUse`. The sets keep
+    /// the PascalCase names the rest of the matcher already uses.
+    static string CanonicalEvent(string ev)
+    {
+        if (string.IsNullOrEmpty(ev)) return ev;
+        foreach (var name in WorkingEvents)
+            if (string.Equals(name, ev, StringComparison.OrdinalIgnoreCase)) return name;
+        foreach (var name in IdleEvents)
+            if (string.Equals(name, ev, StringComparison.OrdinalIgnoreCase)) return name;
+        foreach (var name in AttentionEvents)
+            if (string.Equals(name, ev, StringComparison.OrdinalIgnoreCase)) return name;
+        if (string.Equals(ev, "Notification", StringComparison.OrdinalIgnoreCase)) return "Notification";
+        if (string.Equals(ev, "StopFailure", StringComparison.OrdinalIgnoreCase)) return "StopFailure";
+        if (string.Equals(ev, "PostToolUseFailure", StringComparison.OrdinalIgnoreCase)) return "PostToolUseFailure";
+        if (string.Equals(ev, "ElicitationResult", StringComparison.OrdinalIgnoreCase)) return "ElicitationResult";
+        return ev;
+    }
 
     /// Event override, applied on top of the log-derived status. "offline"
     /// from logs is only upgraded by a fresh working event (a live hook means
@@ -291,6 +315,7 @@ sealed class StatusService
                 snap.Claude.FiveHourResetMin = cu.PrimaryResetMin;
                 snap.Claude.SevenDayPct = cu.DesktopStale ? null : cu.WeeklyPct;
                 snap.Claude.SevenDayResetMin = cu.WeeklyResetMin;
+                if (!string.IsNullOrEmpty(cu.Period)) snap.Claude.Period = cu.Period;
                 var xu = Usage.Codex;
                 if (xu.PrimaryPct.HasValue)
                 {

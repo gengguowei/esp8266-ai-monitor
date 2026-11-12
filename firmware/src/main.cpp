@@ -1,6 +1,5 @@
-// ESP8266 WiFi clock: shows local time plus live Claude Code / Codex CLI
-// working status and usage quota, polled from a small bridge service that
-// runs on the developer's Mac (see ../bridge/bridge.py).
+// ESP8266 WiFi clock: shows live Grok Build / Codex CLI working status and
+// usage quota, polled from the desktop bridge.
 //
 // Display: 240x240 SPI ST7789 (TFT_eSPI). Pin mapping is set via build_flags
 // in platformio.ini - edit those if your wiring differs.
@@ -19,7 +18,6 @@
 #include "config.h"
 #include "img/claude_sprite.h"
 #include "img/codex_sprite.h"
-#include "img/claude_logo.h"
 #include "img/codex_logo.h"
 
 TFT_eSPI tft = TFT_eSPI();
@@ -153,7 +151,8 @@ struct ClaudeStatus {
   float fiveHourPct = -1; // real OAuth quota from the bridge, -1 = unknown
   int fiveHourResetMin = -1; // minutes until the 5h window resets
   float sevenDayPct = -1;
-  int sevenDayResetMin = -1; // minutes until the 7-day window resets
+  int sevenDayResetMin = -1; // minutes until the credit window resets
+  bool periodMonthly = false; // Grok credit window is monthly rather than weekly
   bool needsInput = false; // waiting on a permission/approval prompt
 };
 
@@ -609,18 +608,28 @@ void drawTinyBoldText(const String &s, int cx, int y, uint16_t color) {
   }
 }
 
-void drawQuotaText(float hourPct, float weekPct, bool force) {
+void drawQuotaText(float hourPct, float weekPct, bool force, const char *singleLabel = "Wk") {
   // Codex dropped the 5h window (2026-07): the bridge then sends
-  // primary_pct=null, so collapse to a single centered "Wk" column.
+  // primary_pct=null, so collapse to a single centered column.
+  // Grok has one credit window too; singleLabel is "Wk" or "Mo".
   bool single = hourPct < 0 && weekPct >= 0;
   static int8_t lastSingle = -1;
+  static const char *lastLabel = "Wk";
+  if (single && singleLabel != lastLabel) {
+    lastLabel = singleLabel;
+    lastSingle = -1;
+  }
   if ((int8_t)single != lastSingle) {
     lastSingle = (int8_t)single;
     force = true;
-    tft.fillRect(0, QUOTA_LABEL_Y, 240, QUOTA_VALUE_Y + 22 - QUOTA_LABEL_Y, TFT_BLACK);
+    // Stay inside the ring. A full-width clear here used to punch a gap out of
+    // both vertical bars (Codex, and Grok, are the single-column case).
+    const int ringInner = RING_MARGIN + RING_THICKNESS;
+    tft.fillRect(ringInner, QUOTA_LABEL_Y, SCREEN_W - 2 * ringInner,
+                 QUOTA_VALUE_Y + 22 - QUOTA_LABEL_Y, TFT_BLACK);
   }
   if (single) {
-    if (force) drawSqTextC("Wk", 120, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    if (force) drawSqTextC(singleLabel, 120, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
     String v = pctText(weekPct);
     if (force || v != lastQuotaWk) {
       lastQuotaWk = v;
@@ -723,8 +732,10 @@ void drawCountdown(bool force) {
   int x = SCREEN_CX - dotTextWidth(t, P, R) / 2;
   if (force) {
     tft.fillRect(SCREEN_CX - 99, 66, 198, 84, TFT_BLACK);
-    drawDotTextC(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", SCREEN_CX, 72, 2, 0,
-                 TFT_LIGHTGREY);
+    const char *cdLabel = "5h RESET IN";
+    if (showingCd == CD_WEEK)
+      cdLabel = (currentApp == APP_CLAUDE && claudeStatus.periodMonthly) ? "Mo RESET IN" : "Wk RESET IN";
+    drawDotTextC(cdLabel, SCREEN_CX, 72, 2, 0, TFT_LIGHTGREY);
     drawDotText(t, x, VAL_Y, P, R, TFT_ORANGE);
   } else {
     // Same length = identical cell layout: repaint only the digits that
@@ -748,12 +759,16 @@ void drawCountdown(bool force) {
 const int LOGO_X = 14, LOGO_Y = 18;
 
 void drawAppLogo() {
-  const uint16_t *logo = (currentApp == APP_CLAUDE) ? claude_logo_0 : codex_logo_0;
-  int w = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_W : CODEX_LOGO_W;
-  int h = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_H : CODEX_LOGO_H;
-  for (int r = 0; r < h; r++) {
-    memcpy_P(rowBuf, logo + (size_t)r * w, (size_t)w * 2);
-    tft.pushImage(LOGO_X, LOGO_Y + r, w, 1, rowBuf);
+  if (currentApp == APP_CLAUDE) {
+    // Pitch 5 dots, about the old 40px logo. The box stays inside the ring
+    // (inner edge is 14) and above the sprite (top around y=60).
+    tft.fillRect(16, 16, 128, 42, TFT_BLACK);
+    drawDotText("GROK", 18, 20, 5, 1, TFT_WHITE);
+    return;
+  }
+  for (int r = 0; r < CODEX_LOGO_H; r++) {
+    memcpy_P(rowBuf, codex_logo_0 + (size_t)r * CODEX_LOGO_W, (size_t)CODEX_LOGO_W * 2);
+    tft.pushImage(LOGO_X, LOGO_Y + r, CODEX_LOGO_W, 1, rowBuf);
   }
 }
 
@@ -790,14 +805,18 @@ float codexRingPct() {
   return max(codexStatus.weeklyPct, 0.0f);
 }
 
-// Claude's ring percentage: real 5h OAuth quota from the bridge when known,
-// otherwise fall back to elapsed session time as a rough stand-in.
+// Grok's ring percentage: the included-credit window when the bridge has it
+// (carried in sevenDayPct; fiveHourPct stays empty), otherwise elapsed
+// session time as a rough stand-in.
 float claudeRingPct() {
   if (claudeStatus.fiveHourPct >= 0) return claudeStatus.fiveHourPct;
+  if (claudeStatus.sevenDayPct >= 0) return claudeStatus.sevenDayPct;
   return claudeStatus.sessionWindowMin > 0
              ? (100.0 * claudeStatus.sessionMin / claudeStatus.sessionWindowMin)
              : 0;
 }
+
+const char *grokQuotaLabel() { return claudeStatus.periodMonthly ? "Mo" : "Wk"; }
 
 // Redraws whichever app is currently active, full screen: quota ring +
 // sprite (or the reset countdown while the 5h window is exhausted).
@@ -812,7 +831,7 @@ void drawActiveApp() {
   if (currentApp == APP_CLAUDE) {
     drawSquareRing(claudeRingPct(), currentStatusColor());
     if (showingCd == CD_NONE) drawClaudeSprite(claudeFrame);
-    drawQuotaText(claudeRingPct(), claudeStatus.sevenDayPct, true);
+    drawQuotaText(claudeStatus.fiveHourPct, claudeStatus.sevenDayPct, true, grokQuotaLabel());
   } else {
     drawSquareRing(codexRingPct(), currentStatusColor());
     if (showingCd == CD_NONE) drawCodexSprite(codexFrame);
@@ -832,7 +851,7 @@ void refreshActiveApp() {
   }
   if (currentApp == APP_CLAUDE) {
     drawSquareRing(claudeRingPct(), currentStatusColor());
-    drawQuotaText(claudeRingPct(), claudeStatus.sevenDayPct, false);
+    drawQuotaText(claudeStatus.fiveHourPct, claudeStatus.sevenDayPct, false, grokQuotaLabel());
   } else {
     drawSquareRing(codexRingPct(), currentStatusColor());
     drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, false);
@@ -1158,7 +1177,10 @@ bool parseStatusJson(const String &payload) {
     setScreenPower(doc["screen_on"].as<bool>());
   }
 
-  JsonObject c = doc["claude"];
+  // "grok" is the current bridge. "claude" remains accepted so an older
+  // bridge build still fills this slot until it is updated.
+  JsonObject c = doc["grok"];
+  if (c.isNull()) c = doc["claude"];
   if (!c.isNull()) {
     claudeStatus.status = c["status"] | "unknown";
     claudeStatus.tokensToday = c["tokens_today"] | 0;
@@ -1169,6 +1191,8 @@ bool parseStatusJson(const String &payload) {
     claudeStatus.sevenDayPct = c["seven_day_pct"] | -1.0;
     claudeStatus.sevenDayResetMin = c["seven_day_reset_min"] | -1;
     claudeStatus.needsInput = c["needs_input"] | false;
+    const char *period = c["period"] | "week";
+    claudeStatus.periodMonthly = strcmp(period, "month") == 0;
   }
 
   JsonObject x = doc["codex"];
@@ -1523,7 +1547,7 @@ void handleRoot() {
           "立刻替换动画，无需重新编译或烧录。GIF 太大可能因内存不足解码失败，换小一点的即可。</p>";
   html += "<form id='gifForm' method='POST' enctype='multipart/form-data' onsubmit='return setGifAction()'>";
   html += "<label>角色</label>";
-  html += "<select id='gifTarget'><option value='claude'>Claude</option><option value='codex'>Codex</option></select>";
+  html += "<select id='gifTarget'><option value='claude'>Grok</option><option value='codex'>Codex</option></select>";
   html += "<label>GIF 文件</label><input type='file' name='file' accept='.gif' required>";
   html += "<button type='submit'>上传并应用</button>";
   html += "</form>";
@@ -1535,7 +1559,7 @@ void handleRoot() {
   html += "<tr><td>WiFi SSID</td><td>" + htmlEscape(WiFi.SSID()) + "</td></tr>";
   html += "<tr><td>设备 IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
   html += "<tr><td>上次桥接更新</td><td>" + age + "</td></tr>";
-  html += "<tr><td>Claude</td><td>" + htmlEscape(claudeStatus.status) + ", " +
+  html += "<tr><td>Grok</td><td>" + htmlEscape(claudeStatus.status) + ", " +
           formatTokens(claudeStatus.tokensToday) + " tok</td></tr>";
   html += "<tr><td>Codex</td><td>" + htmlEscape(codexStatus.status) + ", " +
           formatTokens(codexStatus.tokensToday) + " tok, " +

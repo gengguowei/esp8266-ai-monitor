@@ -33,7 +33,6 @@ sealed class MirrorControl : Control
     public Bitmap UpFrame;
     public StockMonitor.Row[] StockRows = Array.Empty<StockMonitor.Row>();
 
-    static readonly Image ClaudeLogo = LoadAsset("claude-logo.png");
     static readonly Image CodexLogo = LoadAsset("codex-logo.png");
 
     static readonly Color Green = Color.FromArgb(0, 217, 51);
@@ -114,7 +113,12 @@ sealed class MirrorControl : Control
         }
 
         // app logo, top-left inside the ring (firmware draws it at 14,18 @40px)
-        g.DrawImage(ShowingClaude ? ClaudeLogo : CodexLogo, new Rectangle(14, 18, 40, 40));
+        if (ShowingClaude)
+        {
+            using var mark = new Font("Consolas", 28, FontStyle.Bold, GraphicsUnit.Pixel);
+            g.DrawString("GROK", mark, Brushes.White, 18, 20);
+        }
+        else g.DrawImage(CodexLogo, new Rectangle(14, 18, 40, 40));
 
         // quota text
         using (var font = new Font("Consolas", 13, FontStyle.Bold, GraphicsUnit.Pixel))
@@ -197,7 +201,7 @@ sealed class MirrorForm : Form
     readonly MirrorControl _mirror = new();
     readonly RadioButton[] _modeButtons;
     static readonly string[] Modes = { "auto", "claude", "codex", "stock", "up" };
-    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "股票", "UP主" };
+    static readonly string[] ModeLabels = { "自动", "Grok", "Codex", "股票", "UP主" };
     readonly Label _statusLabel = new();
     readonly TrackBar _brightness = new() { Minimum = 0, Maximum = 100, TickStyle = TickStyle.None };
     readonly Label _brightnessValue = new();
@@ -499,12 +503,21 @@ sealed class MirrorForm : Form
         _mirror.ShowingClaude = showing != "codex";
         if (_mirror.ShowingClaude)
         {
-            var pct = snap.Claude.FiveHourPct
+            var pct = snap.Claude.FiveHourPct ?? snap.Claude.SevenDayPct
                 ?? (snap.Claude.SessionWindowMin > 0
                     ? 100.0 * snap.Claude.SessionMin / snap.Claude.SessionWindowMin : 0);
             _mirror.RingPct = pct;
-            _mirror.Line1 = "5h " + PctText(pct);
-            _mirror.Line2 = "Weekly " + PctText(snap.Claude.SevenDayPct);
+            var period = snap.Claude.Period == "month" ? "Monthly" : "Weekly";
+            if (snap.Claude.FiveHourPct.HasValue && snap.Claude.SevenDayPct.HasValue)
+            {
+                _mirror.Line1 = "5h " + PctText(snap.Claude.FiveHourPct);
+                _mirror.Line2 = period + " " + PctText(snap.Claude.SevenDayPct);
+            }
+            else
+            {
+                _mirror.Line1 = period + " " + PctText(pct);
+                _mirror.Line2 = "";
+            }
             _mirror.NeedsInput = snap.Claude.NeedsInput;
         }
         else

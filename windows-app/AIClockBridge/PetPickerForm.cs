@@ -47,7 +47,7 @@ sealed class PetPickerForm : Form
         _listBox.SelectedIndexChanged += (_, _) => PreviewSelectionChanged();
 
         _targetCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-        _targetCombo.Items.AddRange(new object[] { "Claude 角色", "Codex 角色" });
+        _targetCombo.Items.AddRange(new object[] { "Grok 角色", "Codex 角色" });
         _targetCombo.SelectedIndex = 0;
         _targetCombo.SelectedIndexChanged += (_, _) => PreviewSelectionChanged();
 
@@ -217,7 +217,7 @@ sealed class PetPickerForm : Form
         {
             await DeviceClient.UploadGif(gif, s.Slot);
             _statusLabel.Text =
-                $"✅ 已应用：{pet.DisplayName} 现在是 {(s.Slot == "claude" ? "Claude" : "Codex")} 的桌宠";
+                $"✅ 已应用：{pet.DisplayName} 现在是 {(s.Slot == "claude" ? "Grok" : "Codex")} 的桌宠";
         }
         catch (Exception e)
         {

@@ -4,23 +4,21 @@ using System.Text.Json.Nodes;
 
 namespace AIClockBridge;
 
-// Claude Desktop quota comes from its read-only plan-usage-history.json cache.
-// If unavailable, real quota for both CLIs is fetched by reusing the OAuth tokens the
-// CLIs already store locally, no extra login. On Windows both live in files
-// (no Keychain):
-//   Claude: %USERPROFILE%\.claude\.credentials.json, then GET
-//           https://api.anthropic.com/api/oauth/usage  (5h + 7d windows)
-//   Codex:  %USERPROFILE%\.codex\auth.json, then GET
-//           https://chatgpt.com/backend-api/wham/usage (weekly window; older
-//           accounts also had a 5h one - see the classification in FetchCodex)
+// Quota for the two CLIs this bridge still follows, reusing credentials already
+// on disk. No extra login:
+//   Grok:  %USERPROFILE%\.grok\auth.json, then GET the CLI billing endpoint
+//          (one included-credit percentage, weekly or monthly)
+//   Codex: %USERPROFILE%\.codex\auth.json, then GET
+//          https://chatgpt.com/backend-api/wham/usage
 // Tokens never leave this machine except toward their own vendor's API.
 
 class ProviderUsage
 {
     public double? PrimaryPct;     // 5h window used %
     public int? PrimaryResetMin;   // minutes until it resets
-    public double? WeeklyPct;      // 7d / weekly window used %
+    public double? WeeklyPct;      // 7d / weekly window used %, or Grok's single credit window
     public int? WeeklyResetMin;
+    public string Period;          // Grok: "week" or "month". Null for Codex.
     public string Error;
     public DateTime? FetchedAt;
     public bool RateLimited;
@@ -49,37 +47,11 @@ class ProviderUsage
         || DateTime.UtcNow - FetchedAt.Value > DesktopStaleAfter);
 }
 
-sealed class ClaudeCredentialInfo
-{
-    public string FilePath;
-    public string AccessToken;
-    public string RefreshToken;
-    public string ClientId;
-    public string[] Scopes = Array.Empty<string>();
-    public DateTimeOffset? ExpiresAt;
-    public DateTimeOffset? RefreshTokenExpiresAt;
-}
-
 sealed class UsageFetcher
 {
     // Rebuildable: a proxy client toggled while we run would otherwise strand
     // every quota request until the process restarts. See ResilientHttpClient.
     static readonly ResilientHttpClient Http = new("usage", TimeSpan.FromSeconds(20));
-    static readonly SemaphoreSlim ClaudeRefreshLock = new(1, 1);
-
-    // Claude Code refreshes five minutes early.  Wait until the last 90 seconds
-    // so an active CLI gets first chance and this bridge remains only a fallback.
-    static readonly TimeSpan ClaudeRefreshWindow = TimeSpan.FromSeconds(90);
-    static readonly TimeSpan ClaudeRefreshFailureBackoff = TimeSpan.FromMinutes(15);
-    const string ClaudeOAuthTokenUrl = "https://platform.claude.com/v1/oauth/token";
-    const string ClaudeDefaultClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-    static readonly string[] ClaudeDefaultScopes =
-    {
-        "user:profile", "user:inference", "user:sessions:claude_code",
-        "user:mcp_servers", "user:file_upload"
-    };
-    static DateTimeOffset _claudeRefreshRetryAt = DateTimeOffset.MinValue;
-    static string _claudeRejectedRefreshToken;
 
     readonly object _lock = new();
     ProviderUsage _claude = new();
@@ -153,7 +125,7 @@ sealed class UsageFetcher
     // Persisted last-good quota, so a cold start that lands inside the Claude
     // endpoint's 429 window shows the previous percentages instead of a blank
     // until the first successful fetch (which Merge() then keeps rolling).
-    const string ClaudeCacheKey = "usage_cache_claude";
+    const string ClaudeCacheKey = "usage_cache_grok";
     const string CodexCacheKey = "usage_cache_codex";
     static readonly double CacheMaxAgeSec = 24 * 3600;
 
@@ -227,20 +199,9 @@ sealed class UsageFetcher
 
         Task.Run(async () =>
         {
-            // Free local file read, so it happens on every pass and acts as the
-            // floor under whatever the network can or cannot provide.
-            var desktop = ClaudeDesktopUsage.Read();
-            var desktopError = desktop?.Error;   // kept for the log; overwritten below
-            var api = doClaude ? await FetchClaudeApi() : null;
+            var api = doClaude ? await FetchGrok() : null;
             if (doClaude && HasNumbers(api)) _claudeApiOkAt = DateTime.UtcNow;
-            var claude = ChooseClaude(api, desktop, doClaude,
-                DateTime.UtcNow - _claudeApiOkAt <= ApiTrustWindow);
-            // Falling back is not silent: carry the reason onto the cache
-            // reading so the tray says why the live source went away instead of
-            // just showing an older timestamp.
-            if (claude is { DesktopCache: true } && api?.Error != null)
-                claude.Error = claude.Error == null ? api.Error
-                    : $"{claude.Error}；{api.Error}";
+            var claude = api;
             var codex = doCodex ? await FetchCodex() : null;
 
             if (claude == null && codex == null)
@@ -274,14 +235,9 @@ sealed class UsageFetcher
             if (claude != null && claude.FetchedAt.HasValue && !claude.DesktopCache)
                 SaveCache(mergedClaude, ClaudeCacheKey);
             if (codex != null && codex.FetchedAt.HasValue) SaveCache(mergedCodex, CodexCacheKey);
-            // Log the OAuth failure itself, not the reading that replaced it.
-            // `claude` is the Desktop cache object on a fallback pass and its
-            // Error is normally null, so every fallback used to be invisible -
-            // no log line, no way to tell a stuck quota from an unchanged one.
-            if (api?.Error != null)
-                Log.Write($"[usage] claude: {api.Error}"
-                    + (claude is { DesktopCache: true } ? "（改用桌面缓存）" : ""));
-            if (desktopError != null) Log.Write($"[usage] claude 桌面缓存: {desktopError}");
+            if (api?.Error != null) Log.Write($"[usage] grok: {api.Error}");
+            else if (api?.WeeklyPct != null)
+                Log.Write($"[usage] grok: {api.WeeklyPct:0.#}% {api.Period}");
             if (codex?.Error != null) Log.Write($"[usage] codex: {codex.Error}");
             if (_ui != null) _ui.Post(_ => OnUpdate?.Invoke(), null);
             else OnUpdate?.Invoke();
@@ -333,6 +289,8 @@ sealed class UsageFetcher
         if (u.WeeklyPct.HasValue) dict["wPct"] = u.WeeklyPct.Value;
         if (u.WeeklyResetMin.HasValue)
             dict["wResetAt"] = fetchedAt + u.WeeklyResetMin.Value * 60.0;
+        if (u.Period == "month") dict["period"] = 2;
+        else if (u.Period == "week") dict["period"] = 1;
         try { Settings.Set(key, JsonSerializer.Serialize(dict)); }
         catch { /* best effort */ }
     }
@@ -354,6 +312,8 @@ sealed class UsageFetcher
             if (u.PrimaryPct == null && u.WeeklyPct == null) return null;
             if (dict.TryGetValue("pResetAt", out var pr)) u.PrimaryResetMin = Math.Max(0, (int)((pr - now) / 60));
             if (dict.TryGetValue("wResetAt", out var wr)) u.WeeklyResetMin = Math.Max(0, (int)((wr - now) / 60));
+            if (dict.TryGetValue("period", out var period))
+                u.Period = period >= 2 ? "month" : "week";
             u.FetchedAt = DateTimeOffset.FromUnixTimeSeconds((long)at).UtcDateTime;
             return u;
         }
@@ -378,6 +338,7 @@ sealed class UsageFetcher
                 PrimaryResetMin = old.PrimaryResetMin,
                 WeeklyPct = old.WeeklyPct,
                 WeeklyResetMin = old.WeeklyResetMin,
+                Period = old.Period,
                 FetchedAt = old.FetchedAt,
                 DesktopCache = old.DesktopCache,
                 Error = fresh.Error,
@@ -388,51 +349,26 @@ sealed class UsageFetcher
         return fresh;
     }
 
-    // MARK: - Claude (api.anthropic.com/api/oauth/usage)
+    // MARK: - Grok (cli-chat-proxy.grok.com billing)
 
-    /// CLI-OAuth fallback. Refresh() reads the Desktop cache first and only
-    /// calls this when there is none, so this method never touches that cache.
-    static async Task<ProviderUsage> FetchClaudeApi()
+    static async Task<ProviderUsage> FetchGrok()
     {
         var usage = new ProviderUsage();
-        var credential = ClaudeCredential();
-        if (credential == null)
+        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".grok", "auth.json");
+        var auth = GrokUsage.ReadAuth(path, DateTimeOffset.UtcNow);
+        if (auth.Error != null)
         {
-            // The Desktop cache is consulted separately now, so this branch only
-            // means "no OAuth credentials" - it is not fatal on its own.
-            usage.Error = "未找到 CLI/插件凭据（~/.claude/.credentials.json），回退到桌面版缓存";
-            usage.AuthenticationError = true;
+            usage.Error = auth.Error;
+            usage.AuthenticationError = auth.AuthenticationError;
             return usage;
         }
-
-        var refresh = await RefreshClaudeCredentialIfNeeded(credential);
-        if (refresh.Credential != null) credential = refresh.Credential;
-        if (refresh.Error != null)
-        {
-            var expired = credential.ExpiresAt.HasValue
-                && credential.ExpiresAt.Value <= DateTimeOffset.UtcNow;
-            if (expired || refresh.AuthenticationError || refresh.RateLimited)
-            {
-                usage.Error = refresh.Error;
-                usage.AuthenticationError = refresh.AuthenticationError;
-                usage.RateLimited = refresh.RateLimited;
-                usage.RetryAfterSeconds = refresh.RetryAfterSeconds;
-                return usage;
-            }
-        }
-        if (credential.ExpiresAt.HasValue
-            && credential.ExpiresAt.Value <= DateTimeOffset.UtcNow)
-        {
-            usage.Error = "Claude 凭据已过期，请运行 claude auth login 重新登录";
-            usage.AuthenticationError = true;
-            return usage;
-        }
-        using var req = new HttpRequestMessage(HttpMethod.Get,
-            "https://api.anthropic.com/api/oauth/usage");
-        req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {credential.AccessToken}");
+        using var req = new HttpRequestMessage(HttpMethod.Get, GrokUsage.BillingUrl);
+        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + auth.AccessToken);
+        req.Headers.TryAddWithoutValidation("X-XAI-Token-Auth", "xai-grok-cli");
+        if (!string.IsNullOrEmpty(auth.UserId))
+            req.Headers.TryAddWithoutValidation("x-userid", auth.UserId);
+        req.Headers.TryAddWithoutValidation("x-grok-client-version", GrokUsage.ClientVersion);
         req.Headers.TryAddWithoutValidation("Accept", "application/json");
-        req.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
-        req.Headers.TryAddWithoutValidation("User-Agent", "claude-code/2.1.0");
 
         string body;
         int code;
@@ -442,345 +378,34 @@ sealed class UsageFetcher
             code = (int)resp.StatusCode;
             body = await resp.Content.ReadAsStringAsync();
             if (code == 429) usage.RetryAfterSeconds = RetryAfterSeconds(resp);
-            Http.ReportSuccess();   // a 401/429 still proves the path works
+            Http.ReportSuccess();
         }
         catch (Exception ex)
         {
             Http.ReportTransportFailure(ex.Message);
-            usage.Error = $"Claude 用量请求失败：{ex.Message}";
+            usage.Error = "Grok 用量请求失败：" + ex.Message;
             return usage;
         }
-        if (code != 200)
+        if (code == 401 || code == 403)
         {
-            usage.RateLimited = code == 429;
-            usage.AuthenticationError = code == 401 || code == 403;
-            usage.Error = code == 401 ? "Claude 凭据过期，运行 claude 重新登录"
-                : code == 429 ? "Claude 用量接口限流，稍后自动重试"
-                : $"Claude 用量接口 HTTP {code}";
+            usage.Error = GrokUsage.ExpiredMessage;
+            usage.AuthenticationError = true;
             return usage;
         }
-        try
+        if (code == 429)
         {
-            using var doc = JsonDocument.Parse(body);
-            var now = DateTimeOffset.UtcNow;
-            if (doc.RootElement.TryGetProperty("five_hour", out var fiveHour))
-            {
-                usage.PrimaryPct = NumberOrNull(fiveHour, "utilization");
-                usage.PrimaryResetMin = MinutesUntil(StringOrNull(fiveHour, "resets_at"), now);
-            }
-            if (doc.RootElement.TryGetProperty("seven_day", out var sevenDay))
-            {
-                usage.WeeklyPct = NumberOrNull(sevenDay, "utilization");
-                usage.WeeklyResetMin = MinutesUntil(StringOrNull(sevenDay, "resets_at"), now);
-            }
-            usage.FetchedAt = DateTime.UtcNow;
+            usage.Error = "Grok 用量接口限流";
+            usage.RateLimited = true;
+            return usage;
         }
-        catch
+        if (code < 200 || code >= 300)
         {
-            usage.Error = "Claude 用量响应解析失败";
+            usage.Error = "Grok 用量请求失败：HTTP " + code;
+            return usage;
         }
-        return usage;
-    }
-
-    /// Claude Code on Windows stores OAuth credentials as a plain JSON file:
-    /// {"claudeAiOauth":{"accessToken":…}}
-    static ClaudeCredentialInfo ClaudeCredential()
-    {
-        var credFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".claude", ".credentials.json");
-        try
-        {
-            using var doc = JsonDocument.Parse(File.ReadAllText(credFile));
-            if (doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth)
-                && oauth.TryGetProperty("accessToken", out var token)
-                && token.ValueKind == JsonValueKind.String)
-            {
-                var t = token.GetString();
-                if (string.IsNullOrEmpty(t)) return null;
-                string refreshToken = null;
-                if (oauth.TryGetProperty("refreshToken", out var refresh)
-                    && refresh.ValueKind == JsonValueKind.String)
-                    refreshToken = refresh.GetString();
-                string clientId = null;
-                if (oauth.TryGetProperty("clientId", out var client)
-                    && client.ValueKind == JsonValueKind.String)
-                    clientId = client.GetString();
-                var scopes = Array.Empty<string>();
-                if (oauth.TryGetProperty("scopes", out var scopeElement)
-                    && scopeElement.ValueKind == JsonValueKind.Array)
-                    scopes = scopeElement.EnumerateArray()
-                        .Where(v => v.ValueKind == JsonValueKind.String)
-                        .Select(v => v.GetString())
-                        .Where(v => !string.IsNullOrWhiteSpace(v))
-                        .ToArray();
-                return new ClaudeCredentialInfo
-                {
-                    FilePath = credFile,
-                    AccessToken = t,
-                    RefreshToken = refreshToken,
-                    ClientId = clientId,
-                    Scopes = scopes,
-                    ExpiresAt = EpochMilliseconds(oauth, "expiresAt"),
-                    RefreshTokenExpiresAt = EpochMilliseconds(oauth, "refreshTokenExpiresAt")
-                };
-            }
-        }
-        catch
-        {
-            // missing / unreadable
-        }
-        return null;
-    }
-
-    static DateTimeOffset? EpochMilliseconds(JsonElement obj, string property)
-    {
-        if (!obj.TryGetProperty(property, out var value)) return null;
-        long epochMs;
-        if (!((value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out epochMs))
-              || (value.ValueKind == JsonValueKind.String
-                  && long.TryParse(value.GetString(), out epochMs)))) return null;
-        try { return DateTimeOffset.FromUnixTimeMilliseconds(epochMs); }
-        catch (ArgumentOutOfRangeException) { return null; }
-    }
-
-    static async Task<(ClaudeCredentialInfo Credential, string Error,
-        bool AuthenticationError, bool RateLimited, int? RetryAfterSeconds)>
-        RefreshClaudeCredentialIfNeeded(ClaudeCredentialInfo credential)
-    {
-        var now = DateTimeOffset.UtcNow;
-        if (!credential.ExpiresAt.HasValue
-            || credential.ExpiresAt.Value > now + ClaudeRefreshWindow)
-            return (credential, null, false, false, null);
-
-        if (string.IsNullOrEmpty(credential.RefreshToken))
-            return (credential, "Claude 凭据已过期且没有 refresh token，请运行 claude auth login", true, false, null);
-        if (credential.RefreshTokenExpiresAt.HasValue
-            && credential.RefreshTokenExpiresAt.Value <= now)
-            return (credential, "Claude refresh token 已过期，请运行 claude auth login", true, false, null);
-        if (credential.RefreshToken == _claudeRejectedRefreshToken)
-            return (credential, "Claude refresh token 已被服务端拒绝，请运行 claude auth login", true, false, null);
-        if (now < _claudeRefreshRetryAt)
-            return (credential, "Claude 凭据自动刷新暂时失败，稍后再试", false, false,
-                Math.Max(1, (int)Math.Ceiling((_claudeRefreshRetryAt - now).TotalSeconds)));
-
-        await ClaudeRefreshLock.WaitAsync();
-        try
-        {
-            // Another refresh (or claude CLI) may have completed while waiting.
-            var latest = ClaudeCredential();
-            if (latest == null) return (credential, "Claude 凭据文件无法读取", true, false, null);
-            credential = latest;
-            now = DateTimeOffset.UtcNow;
-            if (!credential.ExpiresAt.HasValue
-                || credential.ExpiresAt.Value > now + ClaudeRefreshWindow)
-                return (credential, null, false, false, null);
-            if (string.IsNullOrEmpty(credential.RefreshToken))
-                return (credential, "Claude 凭据已过期且没有 refresh token，请运行 claude auth login", true, false, null);
-            if (credential.RefreshTokenExpiresAt.HasValue
-                && credential.RefreshTokenExpiresAt.Value <= now)
-                return (credential, "Claude refresh token 已过期，请运行 claude auth login", true, false, null);
-            if (credential.RefreshToken == _claudeRejectedRefreshToken)
-                return (credential, "Claude refresh token 已被服务端拒绝，请运行 claude auth login", true, false, null);
-            if (now < _claudeRefreshRetryAt)
-                return (credential, "Claude 凭据自动刷新暂时失败，稍后再试", false, false,
-                    Math.Max(1, (int)Math.Ceiling((_claudeRefreshRetryAt - now).TotalSeconds)));
-
-            // Do not rotate a refresh token unless the credential file is
-            // writable; a successful refresh may invalidate the old token.
-            try
-            {
-                using var writable = new FileStream(credential.FilePath, FileMode.Open,
-                    FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
-            }
-            catch (Exception ex)
-            {
-                return (credential, $"Claude 凭据文件不可写：{ex.Message}", false, false, null);
-            }
-
-            var scopes = credential.Scopes.Length > 0 ? credential.Scopes : ClaudeDefaultScopes;
-            var payload = JsonSerializer.Serialize(new Dictionary<string, object>
-            {
-                ["grant_type"] = "refresh_token",
-                ["refresh_token"] = credential.RefreshToken,
-                ["client_id"] = string.IsNullOrEmpty(credential.ClientId)
-                    ? ClaudeDefaultClientId : credential.ClientId,
-                ["scope"] = string.Join(" ", scopes)
-            });
-            using var request = new HttpRequestMessage(HttpMethod.Post, ClaudeOAuthTokenUrl);
-            request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Content = new StringContent(payload, Encoding.UTF8);
-            request.Content.Headers.Remove("Content-Type");
-            request.Content.Headers.TryAddWithoutValidation("Content-Type", "application/json");
-
-            HttpResponseMessage response;
-            string body;
-            try
-            {
-                response = await Http.Client.SendAsync(request);
-                body = await response.Content.ReadAsStringAsync();
-                Http.ReportSuccess();
-            }
-            catch (Exception ex)
-            {
-                Http.ReportTransportFailure(ex.Message);
-                _claudeRefreshRetryAt = DateTimeOffset.UtcNow + ClaudeRefreshFailureBackoff;
-                return (credential, $"Claude 凭据自动刷新失败：{ex.Message}", false, false,
-                    (int)ClaudeRefreshFailureBackoff.TotalSeconds);
-            }
-            using (response)
-            {
-                var code = (int)response.StatusCode;
-                if (code < 200 || code > 299)
-                {
-                    var description = OAuthErrorDescription(body);
-                    var authError = code == 400 || code == 401 || code == 403;
-                    if (authError) _claudeRejectedRefreshToken = credential.RefreshToken;
-                    var retryAfter = code == 429 ? RetryAfterSeconds(response) : null;
-                    var delay = retryAfter.HasValue
-                        ? TimeSpan.FromSeconds(Math.Max(retryAfter.Value,
-                            (int)ClaudeRefreshFailureBackoff.TotalSeconds))
-                        : ClaudeRefreshFailureBackoff;
-                    _claudeRefreshRetryAt = DateTimeOffset.UtcNow + delay;
-                    var message = authError
-                        ? $"Claude 凭据自动刷新被拒绝{description}，请运行 claude auth login"
-                        : code == 429
-                            ? "Claude 凭据刷新接口限流，稍后自动重试"
-                            : $"Claude 凭据自动刷新 HTTP {code}";
-                    return (credential, message, authError, code == 429,
-                        code == 429 ? (int)delay.TotalSeconds : null);
-                }
-            }
-
-            ClaudeCredentialInfo refreshed;
-            try
-            {
-                using var doc = JsonDocument.Parse(body);
-                var root = doc.RootElement;
-                if (!root.TryGetProperty("access_token", out var accessElement)
-                    || accessElement.ValueKind != JsonValueKind.String
-                    || string.IsNullOrEmpty(accessElement.GetString())
-                    || !root.TryGetProperty("expires_in", out var expiresElement)
-                    || expiresElement.ValueKind != JsonValueKind.Number
-                    || !expiresElement.TryGetDouble(out var expiresIn)
-                    || expiresIn <= 0)
-                    throw new JsonException("missing access_token or expires_in");
-
-                var refreshToken = credential.RefreshToken;
-                if (root.TryGetProperty("refresh_token", out var refreshElement)
-                    && refreshElement.ValueKind == JsonValueKind.String
-                    && !string.IsNullOrEmpty(refreshElement.GetString()))
-                    refreshToken = refreshElement.GetString();
-                var refreshedScopes = scopes;
-                if (root.TryGetProperty("scope", out var returnedScope)
-                    && returnedScope.ValueKind == JsonValueKind.String
-                    && !string.IsNullOrWhiteSpace(returnedScope.GetString()))
-                    refreshedScopes = returnedScope.GetString()
-                        .Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                DateTimeOffset? refreshExpiresAt = credential.RefreshTokenExpiresAt;
-                if (root.TryGetProperty("refresh_token_expires_in", out var refreshExpires)
-                    && refreshExpires.ValueKind == JsonValueKind.Number
-                    && refreshExpires.TryGetDouble(out var refreshExpiresIn)
-                    && refreshExpiresIn > 0)
-                    refreshExpiresAt = DateTimeOffset.UtcNow.AddSeconds(refreshExpiresIn);
-
-                refreshed = new ClaudeCredentialInfo
-                {
-                    FilePath = credential.FilePath,
-                    AccessToken = accessElement.GetString(),
-                    RefreshToken = refreshToken,
-                    ClientId = credential.ClientId,
-                    Scopes = refreshedScopes,
-                    ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(expiresIn),
-                    RefreshTokenExpiresAt = refreshExpiresAt
-                };
-            }
-            catch
-            {
-                _claudeRefreshRetryAt = DateTimeOffset.UtcNow + ClaudeRefreshFailureBackoff;
-                return (credential, "Claude 凭据刷新响应解析失败", false, false,
-                    (int)ClaudeRefreshFailureBackoff.TotalSeconds);
-            }
-
-            try
-            {
-                var persisted = PersistClaudeCredential(
-                    credential.AccessToken, credential.RefreshToken, refreshed);
-                if (persisted != null) refreshed = persisted;
-            }
-            catch (Exception ex)
-            {
-                _claudeRefreshRetryAt = DateTimeOffset.UtcNow + ClaudeRefreshFailureBackoff;
-                return (credential, $"Claude 新凭据写入失败：{ex.Message}", true, false, null);
-            }
-
-            _claudeRejectedRefreshToken = null;
-            _claudeRefreshRetryAt = DateTimeOffset.MinValue;
-            return (refreshed, null, false, false, null);
-        }
-        finally
-        {
-            ClaudeRefreshLock.Release();
-        }
-    }
-
-    static ClaudeCredentialInfo PersistClaudeCredential(string postedAccessToken,
-        string postedRefreshToken, ClaudeCredentialInfo refreshed)
-    {
-        var root = JsonNode.Parse(File.ReadAllText(refreshed.FilePath)) as JsonObject;
-        var oauth = root?["claudeAiOauth"] as JsonObject;
-        if (root == null || oauth == null) throw new JsonException("凭据文件结构无效");
-        var currentAccessToken = oauth["accessToken"]?.GetValue<string>();
-        var currentRefreshToken = oauth["refreshToken"]?.GetValue<string>();
-        // If Claude CLI won the race, use its newer credentials and never
-        // overwrite them with this response.
-        if (!string.Equals(currentAccessToken, postedAccessToken, StringComparison.Ordinal)
-            || !string.Equals(currentRefreshToken, postedRefreshToken, StringComparison.Ordinal))
-            return ClaudeCredential();
-
-        oauth["accessToken"] = refreshed.AccessToken;
-        oauth["refreshToken"] = refreshed.RefreshToken;
-        if (refreshed.ExpiresAt.HasValue)
-            oauth["expiresAt"] = refreshed.ExpiresAt.Value.ToUnixTimeMilliseconds();
-        if (refreshed.RefreshTokenExpiresAt.HasValue)
-            oauth["refreshTokenExpiresAt"] =
-                refreshed.RefreshTokenExpiresAt.Value.ToUnixTimeMilliseconds();
-        var scopeArray = new JsonArray();
-        foreach (var scope in refreshed.Scopes) scopeArray.Add(scope);
-        oauth["scopes"] = scopeArray;
-
-        var temp = refreshed.FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
-        {
-            File.WriteAllText(temp, root.ToJsonString(new JsonSerializerOptions
-            {
-                WriteIndented = true
-            }), new UTF8Encoding(false));
-            var latest = ClaudeCredential();
-            if (latest == null) throw new IOException("凭据文件无法重新读取");
-            if (!string.Equals(latest.AccessToken, postedAccessToken, StringComparison.Ordinal)
-                || !string.Equals(latest.RefreshToken, postedRefreshToken, StringComparison.Ordinal))
-                return latest;
-            File.Replace(temp, refreshed.FilePath, null, true);
-        }
-        finally
-        {
-            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
-        }
-        return refreshed;
-    }
-
-    static string OAuthErrorDescription(string body)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            var error = StringOrNull(doc.RootElement, "error");
-            var description = StringOrNull(doc.RootElement, "error_description");
-            var text = !string.IsNullOrWhiteSpace(description) ? description : error;
-            return string.IsNullOrWhiteSpace(text) ? "" : $"（{text}）";
-        }
-        catch { return ""; }
+        var parsed = GrokUsage.Parse(body, DateTimeOffset.UtcNow);
+        parsed.RetryAfterSeconds = usage.RetryAfterSeconds;
+        return parsed;
     }
 
     static int? RetryAfterSeconds(HttpResponseMessage response)

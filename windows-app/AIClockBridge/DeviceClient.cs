@@ -43,7 +43,13 @@ static class DeviceClient
     // per-request CancellationTokenSources carry the timeouts (5s info, 8s
     // posts, 30s sprite pull, 60s GIF upload+on-device decode), so the client
     // itself must not impose a shorter global one
-    static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
+    // The clock is on the LAN. The system proxy (used for Grok/Codex quota)
+    // must not intercept these requests, or GIF upload and the device API fail
+    // while USB status still looks healthy.
+    static readonly HttpClient Http = new(new SocketsHttpHandler { UseProxy = false })
+    {
+        Timeout = Timeout.InfiniteTimeSpan,
+    };
     public static SerialLink Serial { get; set; }
 
     public static bool UsbConnected => Serial?.IsLinked == true;

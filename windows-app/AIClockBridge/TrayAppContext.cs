@@ -22,7 +22,7 @@ sealed class TrayAppContext : ApplicationContext
     readonly MirrorForm _mirror;
     readonly ContextMenuStrip _menu = new();
 
-    readonly ToolStripMenuItem _claudeUsageItem = new("Claude …") { Enabled = false };
+    readonly ToolStripMenuItem _claudeUsageItem = new("Grok …") { Enabled = false };
     readonly ToolStripMenuItem _codexUsageItem = new("Codex …") { Enabled = false };
     readonly ToolStripMenuItem _deviceInfoItem = new("设备：未设置") { Enabled = false };
     /// The device reports its IP/SSID/bridge host in every #DEVICE reply, but
@@ -91,10 +91,9 @@ sealed class TrayAppContext : ApplicationContext
         var now = DateTime.UtcNow;
         if (!UsageFetcher.ClaudeAuthNoticeDue(error, _usage.Claude, now, _claudeAuthNoticeAt)) return;
         _claudeAuthNoticeAt = now;
-        Log.Write($"[usage] claude: 凭据失效通知已弹出（{error}）");
-        _trayIcon.ShowBalloonTip(15000, "Claude 额度暂时取不到",
-            $"{error}。\n在 Claude Code 中执行 /login（或终端 claude auth login）重新登录；"
-            + "点一下 Claude 桌面版托盘图标可临时恢复。", ToolTipIcon.Warning);
+        Log.Write($"[usage] grok: 凭据失效通知已弹出（{error}）");
+        _trayIcon.ShowBalloonTip(15000, "Grok 额度暂时取不到",
+            $"{error}。\n在终端执行 grok login 重新登录。", ToolTipIcon.Warning);
     }
 
     /// User-supplied device logo (bezel + dark screen + smiley + green status
@@ -115,12 +114,12 @@ sealed class TrayAppContext : ApplicationContext
     {
         _menu.Items.Add(_claudeUsageItem);
         _menu.Items.Add(_codexUsageItem);
-        _menu.Items.Add(MakeItem("启用 Claude 桌面状态同步", (_, _) =>
+        _menu.Items.Add(MakeItem("启用 Grok 状态同步", (_, _) =>
         {
             try
             {
                 var path = ClaudeHooks.Install();
-                MessageBox.Show($"已配置状态 Hooks，请重新打开 Claude Code 本地会话。\n设置：{path}\n原有设置已保留；已有文件会生成备份。", "Claude 状态同步");
+                MessageBox.Show($"已配置状态 Hooks，请重新打开 Grok 会话。\n设置：{path}\n原有设置已保留；已有文件会生成备份。", "Grok 状态同步");
             }
             catch (Exception ex) { MessageBox.Show(ex.Message, "配置失败"); }
         }));
@@ -135,7 +134,7 @@ sealed class TrayAppContext : ApplicationContext
         var displayMenu = new ToolStripMenuItem("屏幕显示");
         foreach (var (title, mode) in new[]
         {
-            ("自动（开盘看股票，空闲轮换 Claude/Codex/UP主）", "auto"), ("固定 Claude", "claude"),
+            ("自动（开盘看股票，空闲轮换 Grok/Codex/UP主）", "auto"), ("固定 Grok", "claude"),
             ("固定 Codex", "codex"), ("股票行情", "stock"),
             ("UP主", "up"),
         })
@@ -201,7 +200,7 @@ sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(MakeItem("更换桌宠动画…（petdex）", (_, _) => OpenPetPicker()));
 
         var resetMenu = new ToolStripMenuItem("恢复默认动画");
-        foreach (var (title, slot) in new[] { ("Claude 恢复默认", "claude"), ("Codex 恢复默认", "codex") })
+        foreach (var (title, slot) in new[] { ("Grok 恢复默认", "claude"), ("Codex 恢复默认", "codex") })
         {
             var item = new ToolStripMenuItem(title);
             item.Click += async (_, _) => await ResetSprite(slot);
@@ -360,7 +359,8 @@ sealed class TrayAppContext : ApplicationContext
 
     void RefreshUsageLines()
     {
-        _claudeUsageItem.Text = UsageLine("Claude", _usage.Claude, "7天");
+        var grok = _usage.Claude;
+        _claudeUsageItem.Text = UsageLine("Grok", grok, grok.Period == "month" ? "月" : "周");
         _codexUsageItem.Text = UsageLine("Codex", _usage.Codex, "周");
     }
 
@@ -393,7 +393,7 @@ sealed class TrayAppContext : ApplicationContext
             // unavailable - the whole reason this line is not "凭据实时".
             return u.Error == null ? result : result + $"　（{u.Error}）";
         }
-        if (name == "Claude" && u.FetchedAt.HasValue)
+        if (name == "Grok" && u.FetchedAt.HasValue)
             result += $"　（凭据实时 · {u.FetchedAt?.ToLocalTime():HH:mm}）";
         return u.Error == null ? result : result + $"　（缓存：{u.Error}）";
     }
@@ -442,7 +442,7 @@ sealed class TrayAppContext : ApplicationContext
         };
         var showing = info.Effective == "stock" ? "股票"
             : info.Effective == "up" ? "UP主"
-            : (info.Showing == "claude" ? "Claude" : "Codex");
+            : (info.Showing == "claude" ? "Grok" : "Codex");
         _deviceInfoItem.Text =
             $"设备：{info.Transport} · 正在显示 {showing} · {string.Join(" ", sprites)}";
         ShowDeviceNetState(info);

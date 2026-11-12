@@ -69,7 +69,7 @@ static class Program
 
         // Same idea for the Claude status hook script this build ships.
         var hookRefresh = ClaudeHooks.RefreshScript();
-        if (hookRefresh != null) Log.Write($"[hooks] claude status script {hookRefresh}");
+        if (hookRefresh != null) Log.Write($"[hooks] grok status script {hookRefresh}");
 
         var service = new StatusService();
         var usage = new UsageFetcher();
@@ -102,8 +102,8 @@ static class Program
             },
             postRoutes: new()
             {
-                // Claude Code / Codex hooks push lifecycle events here (README §7):
-                // curl -d '{"agent":"claude","event":"PreToolUse"}' http://127.0.0.1:8765/event
+                // Grok / Codex hooks push lifecycle events here:
+                // curl -d '{"agent":"grok","event":"PreToolUse"}' http://127.0.0.1:8765/event
                 ["/event"] = body =>
                 {
                     try
